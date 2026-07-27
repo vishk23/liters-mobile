@@ -1,20 +1,33 @@
 //! Ports of litestream's `wal_reader_test.go` cases, run against the same
 //! fixture files in reference/litestream/testdata/wal-reader/.
+//!
+//! That checkout is not in the repo; `make reference` fetches it, and
+//! `make test` runs that first. Without it the fixture-backed cases print a
+//! skip notice and pass, as the oracle-backed suites do without the oracle.
 
 use std::path::PathBuf;
 
 use liters_wal::{WalError, WalReader};
 
-fn fixture(name: &str) -> Vec<u8> {
+/// Reads a wal-reader fixture from the pinned litestream checkout.
+/// Returns None (and prints a skip notice) if the checkout is absent.
+fn fixture(name: &str) -> Option<Vec<u8>> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../reference/litestream/testdata/wal-reader")
         .join(name);
-    std::fs::read(&path).unwrap_or_else(|e| panic!("read fixture {path:?}: {e}"))
+    match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("SKIP: fixture {path:?} not found; run `make reference`");
+            None
+        }
+        Err(e) => panic!("read fixture {path:?}: {e}"),
+    }
 }
 
 #[test]
 fn ok() {
-    let b = fixture("ok/wal");
+    let Some(b) = fixture("ok/wal") else { return };
     let mut buf = vec![0u8; 4096];
     let mut r = WalReader::new(b.as_slice()).unwrap();
     assert_eq!(r.page_size(), 4096);
@@ -44,7 +57,7 @@ fn ok() {
 
 #[test]
 fn page_map_ok() {
-    let b = fixture("ok/wal");
+    let Some(b) = fixture("ok/wal") else { return };
     let mut r = WalReader::new(b.as_slice()).unwrap();
     let pm = r.page_map().unwrap();
     // Frame starts: 32 (pgno 1), 4152 (pgno 2 commit), 8272 (pgno 2 commit).
@@ -57,7 +70,7 @@ fn page_map_ok() {
 
 #[test]
 fn salt_mismatch() {
-    let b = fixture("salt-mismatch/wal");
+    let Some(b) = fixture("salt-mismatch/wal") else { return };
     let mut buf = vec![0u8; 4096];
     let mut r = WalReader::new(b.as_slice()).unwrap();
     assert_eq!(r.page_size(), 4096);
@@ -72,7 +85,7 @@ fn salt_mismatch() {
 
 #[test]
 fn frame_checksum_mismatch() {
-    let b = fixture("frame-checksum-mismatch/wal");
+    let Some(b) = fixture("frame-checksum-mismatch/wal") else { return };
     let mut buf = vec![0u8; 4096];
     let mut r = WalReader::new(b.as_slice()).unwrap();
 
@@ -121,7 +134,7 @@ fn bad_header_version() {
 
 #[test]
 fn truncated_frames_end_iteration() {
-    let b = fixture("ok/wal");
+    let Some(b) = fixture("ok/wal") else { return };
     let mut buf = vec![0u8; 4096];
 
     // Partial frame header.
@@ -139,7 +152,7 @@ fn truncated_frames_end_iteration() {
 
 #[test]
 fn frame_salts_until() {
-    let b = fixture("frame-salts/wal");
+    let Some(b) = fixture("frame-salts/wal") else { return };
     let r = WalReader::new(b.as_slice()).unwrap();
     let m = r.frame_salts_until((0, 0)).unwrap();
     assert_eq!(m.len(), 3);
@@ -150,7 +163,7 @@ fn frame_salts_until() {
 
 #[test]
 fn with_offset_resume() {
-    let b = fixture("ok/wal");
+    let Some(b) = fixture("ok/wal") else { return };
     let mut r0 = WalReader::new(b.as_slice()).unwrap();
     let (salt1, salt2) = (r0.salt1, r0.salt2);
     let mut buf = vec![0u8; 4096];
