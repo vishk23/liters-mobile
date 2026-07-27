@@ -1,26 +1,25 @@
 # liters-mobile
 
-**A derivative of [`mrkurt/liters`](https://github.com/mrkurt/liters), by Kurt
-Mackey.**
+Continuous SQLite replication you can embed in an iOS or Android app.
+[liters](https://github.com/mrkurt/liters) is a Rust library that reads and
+writes Litestream v0.5's LTX file format and bucket layout and exposes it to a
+host app through UniFFI. This repository carries the work that makes embedding
+it in a real mobile app practical: linking **one** SQLite instead of two, an
+HTTP path a suspended app can hand to a background `URLSession` instead of
+losing the upload, and per-push telemetry that turns "is this viable on this
+device?" into an answerable question. Each is described below.
 
-Kurt wrote liters: the LTX v0.5 codec, the SQLite WAL reader, the storage
-backends, the `Writer`/`Replica`/`Manager` surface, the liters HTTP replication
-protocol, and the UniFFI bindings. That is the substantial majority of the code
-in this repository. His commits are preserved here unmodified — same SHAs, same
-authorship, same dates; run `git log 108e1df` to read the original history, and
-`git log --author=mrkurt` to see how much of this is his. The code is
-MIT-licensed and is used here with his permission; `LICENSE` carries his
-copyright.
-
-This repository exists for one practical reason. Upstream review is paused
-while Kurt is on sabbatical, and the mobile-embedding work below needs
-somewhere to keep moving in the meantime. It is not a competing project and not
-a hard fork: the changes here are written to go back upstream, and two of them
-are already proposed there — [mrkurt/liters#2](https://github.com/mrkurt/liters/pull/2)
-and [mrkurt/liters#3](https://github.com/mrkurt/liters/pull/3) — from
-[vishk23/liters](https://github.com/vishk23/liters), the GitHub fork that stays
-the vehicle for upstream PRs. **If you want liters itself, go to
-[mrkurt/liters](https://github.com/mrkurt/liters).**
+This is a derivative of [`mrkurt/liters`](https://github.com/mrkurt/liters) by
+Kurt Mackey, MIT-licensed and used with his permission. Kurt wrote liters —
+the LTX v0.5 codec, the SQLite WAL reader, the storage backends, the
+`Writer`/`Replica`/`Manager` surface, the HTTP replication protocol and the
+UniFFI bindings — which is the substantial majority of the code here; his
+commits keep their original SHAs, authorship and dates
+(`git log --author=mrkurt`), and `LICENSE` carries his copyright. The changes
+here are written to go back upstream and are proposed there from
+[vishk23/liters](https://github.com/vishk23/liters), the fork that stays the
+vehicle for upstream PRs. If you want liters itself, go to
+[mrkurt/liters](https://github.com/mrkurt/liters).
 
 ## What this adds beyond upstream
 
