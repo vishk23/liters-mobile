@@ -322,6 +322,26 @@ impl Trailer {
 pub struct PageHeader {
     pub pgno: u32,
     /// Reserved; must be zero in format version 3.
+    ///
+    /// **Forward-compat note.** This is correct for `superfly/ltx` v0.5.1 and
+    /// is what Litestream v0.5.x writes, but it is already outdated on ltx
+    /// `main`: commit `d017048` ("refactor(lz4): switch from frame format to
+    /// block format", #73 — two commits past v0.5.1 and in **no tag** as of
+    /// 2026-07-27) introduces
+    ///
+    /// ```text
+    /// PageHeaderFlagSize = uint16(1 << 0)   // a 4-byte size field follows the page header
+    /// ```
+    ///
+    /// and relaxes its own validation to `flags &^ PageHeaderFlagSize != 0`.
+    /// Pages carrying that flag store a length-prefixed raw LZ4 *block* rather
+    /// than a standalone LZ4 *frame*, so `validate()` below correctly rejects
+    /// them today — a page it cannot decode must not be silently accepted.
+    ///
+    /// The break is one-directional and in our favour: the new Go decoder
+    /// branches on the flag and keeps its frame-format path, so files liters
+    /// writes stay readable by both. Only the *read* side needs work, and only
+    /// once a tagged ltx release carries the change.
     pub flags: u16,
 }
 

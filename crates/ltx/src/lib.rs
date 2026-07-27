@@ -1,9 +1,23 @@
 //! Codec for LTX (Liteserver Transaction) files.
 //!
-//! Byte-compatible with `github.com/superfly/ltx` v0.5.1, the format used by
+//! Format-compatible with `github.com/superfly/ltx` v0.5.1, the format used by
 //! Litestream v0.5.x. The Go source is the authoritative spec; every constant,
 //! layout, and validation rule here mirrors it (file/line references point at
 //! the Go implementation).
+//!
+//! "Format-compatible", not "byte-identical", and the distinction is
+//! structural rather than incidental. The page index stores each page's
+//! `(pgno, offset, size)` where `offset`/`size` are positions of the
+//! *compressed* LZ4 frame, and the whole page index is fed to the file
+//! checksum (`Encoder::finish`, matching Go's `encodePageIndex` +
+//! `Encoder.write` → `writeToHash`, encoder.go:137-165, 270-274). LZ4 encoders
+//! are free to differ, so `lz4_flex` and pierrec/lz4 produce different
+//! compressed sizes for the same page — which moves the index bytes, which
+//! moves the file checksum. Byte-identity with Go is therefore unattainable by
+//! construction, and no amount of encoder tuning would reach it. What *is*
+//! guaranteed, and what the oracle tests assert, is that either side decodes
+//! the other's files to identical page content and identical post-apply
+//! state.
 //!
 //! File layout:
 //!

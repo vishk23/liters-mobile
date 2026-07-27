@@ -2,7 +2,16 @@
 //!
 //! Each LTX page is stored as one standalone LZ4 frame (Go: pierrec/lz4 v4
 //! writer with 64KB blocks, fast level, content checksum on, block
-//! independence on — encoder.go:43-49). The Go decoder requires each frame to
+//! independence on). Only the first two of those four come from ltx:
+//! encoder.go:43-49 applies `BlockSizeOption(Block64Kb)` and
+//! `CompressionLevelOption(Fast)` and nothing else. The content checksum and
+//! block independence are pierrec's *defaults*, which ltx simply does not
+//! override — `NewWriter` applies `DefaultChecksumOption` (writer.go:23),
+//! defined as `ChecksumOption(true)` (options.go:31), and `initW` sets
+//! `BlockIndependenceSet(true)` unconditionally
+//! (internal/lz4stream/frame.go:139-142). Both are therefore load-bearing for
+//! wire compatibility despite appearing nowhere in ltx's source, which is why
+//! they are stated here. The Go decoder requires each frame to
 //! decode to exactly one page and to end exactly at the frame boundary
 //! (decoder.go:176-185), so we parse the frame structure ourselves instead of
 //! using a buffered frame reader that could over-read into the next page
