@@ -77,7 +77,20 @@ pub enum Storage {
 }
 
 impl Storage {
-    fn into_config(self) -> liters::StorageConfig {
+    /// Core config for this storage.
+    ///
+    /// `transport` is the host HTTP transport (an app's `HttpClient`, wrapped)
+    /// that `Storage::Http` requests run through. Passing `None` selects the
+    /// built-in socket transport, which is **`http://` only** — it has no TLS,
+    /// and `HttpReplicaClient::with_options` rejects an `https://` url outright
+    /// rather than downgrading it. On mobile `None` also means the app's own
+    /// HTTP stack is bypassed, so an iOS transfer cannot continue after the app
+    /// suspends (that requires a background `URLSession`), and requests to one
+    /// authority do not share a connection.
+    fn into_config_with(
+        self,
+        transport: Option<Arc<dyn liters::HttpTransport>>,
+    ) -> liters::StorageConfig {
         match self {
             Storage::Dir { path } => liters::StorageConfig::Dir { path: path.into() },
             #[cfg(feature = "s3")]
@@ -108,16 +121,24 @@ impl Storage {
                 // with a per-database persisted id for push registrations;
                 // plain LitersWriter pushes stay headerless (no fencing).
                 options: liters::HttpClientOptions { auth_token, ..Default::default() },
-                // Filled in by the manager wrapper when the app supplied an
-                // `HttpClient` at construction (see `Storage::into_config_with`).
-                transport: None,
+                transport,
             },
         }
     }
 
-    fn into_client(self) -> Result<Box<dyn liters::ReplicaClient>, LitersError> {
-        self.into_config().build().map_err(map_error)
+    fn into_client(
+        self,
+        transport: Option<Arc<dyn liters::HttpTransport>>,
+    ) -> Result<Box<dyn liters::ReplicaClient>, LitersError> {
+        self.into_config_with(transport).build().map_err(map_error)
     }
+}
+
+/// Wraps a host [`HttpClient`] for the core's transport seam, if one was given.
+fn foreign_transport(
+    client: Option<Arc<dyn HttpClient>>,
+) -> Option<Arc<dyn liters::HttpTransport>> {
+    client.map(|c| Arc::new(ForeignTransport(c)) as Arc<dyn liters::HttpTransport>)
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -279,7 +300,29 @@ impl LitersWriter {
     /// first successful push then uploads the backlog).
     #[uniffi::constructor]
     pub fn new(db_path: String, storage: Storage) -> Result<Self, LitersError> {
-        let client = storage.into_client()?;
+        Self::new_with_http_client(db_path, storage, None)
+    }
+
+    /// [`LitersWriter::new`], with the app's own HTTP client executing every
+    /// `Storage::Http` request.
+    ///
+    /// Without this, a `Storage::Http` writer runs on the built-in socket
+    /// transport: `http://` only (an `https://` url is rejected, not silently
+    /// downgraded), one `Connection: close` request per call, and — the part
+    /// that matters on iOS — no way to hand the transfer to a background
+    /// `URLSession`, so an upload in flight when the app suspends is lost.
+    /// Pass the same shared `HttpClient` instance you would give
+    /// `LitersManager`, so writers and followers to one authority coalesce
+    /// onto a single connection.
+    ///
+    /// `null` is exactly [`LitersWriter::new`].
+    #[uniffi::constructor]
+    pub fn new_with_http_client(
+        db_path: String,
+        storage: Storage,
+        http_client: Option<Arc<dyn HttpClient>>,
+    ) -> Result<Self, LitersError> {
+        let client = storage.into_client(foreign_transport(http_client))?;
         let writer = liters::Writer::open(db_path, client, liters::WriterOptions::default())
             .map_err(map_error)?;
         Ok(LitersWriter {
@@ -386,7 +429,21 @@ impl LitersReplica {
     /// and re-restore instead of raising `Diverged`.
     #[uniffi::constructor]
     pub fn new(db_path: String, storage: Storage, auto_reset: bool) -> Result<Self, LitersError> {
-        let client = storage.into_client()?;
+        Self::new_with_http_client(db_path, storage, auto_reset, None)
+    }
+
+    /// [`LitersReplica::new`], with the app's own HTTP client executing every
+    /// `Storage::Http` request. See [`LitersWriter::new_with_http_client`] for
+    /// what the built-in transport cannot do; `null` is exactly
+    /// [`LitersReplica::new`].
+    #[uniffi::constructor]
+    pub fn new_with_http_client(
+        db_path: String,
+        storage: Storage,
+        auto_reset: bool,
+        http_client: Option<Arc<dyn HttpClient>>,
+    ) -> Result<Self, LitersError> {
+        let client = storage.into_client(foreign_transport(http_client))?;
         let replica = liters::Replica::open(
             db_path.clone(),
             client,
@@ -858,7 +915,7 @@ impl liters::HttpTransport for ForeignTransport {
         Ok(liters::TransportResponse {
             status,
             headers: headers.into_iter().map(|h| (h.name, h.value)).collect(),
-            body: Box::new(ForeignBody { resp, leftover: Vec::new() }),
+            body: Box::new(ForeignBody { resp, leftover: Vec::new(), long_lived }),
         })
     }
 }
@@ -910,6 +967,9 @@ impl HttpRequestBody for ChannelRequestBody {
 struct ForeignBody {
     resp: Arc<dyn HttpResponse>,
     leftover: Vec<u8>,
+    /// Whether the request was `long_lived`. `BodyRead::Idle` is only legal for
+    /// those — see the empty-`Data` arm in `read`.
+    long_lived: bool,
 }
 
 impl liters::TransportBody for ForeignBody {
@@ -921,7 +981,24 @@ impl liters::TransportBody for ForeignBody {
             return Ok(liters::BodyRead::Bytes(n));
         }
         match self.resp.read_body(buf.len() as u32) {
-            Ok(BodyChunk::Data { bytes }) if bytes.is_empty() => Ok(liters::BodyRead::Idle),
+            // `Data` is documented as non-empty, so an empty one is a host bug.
+            // On a long-lived body it is harmless and unambiguous — treat it as
+            // the idle tick the host presumably meant. On any other body it is
+            // NOT: `BodyRead::Idle` is documented "Never produced for a
+            // non-long_lived body", and returning it would put the reader in a
+            // loop it has no timeout for, on a stream that may already be dead.
+            // Surface it as a protocol error, which is what a malformed body is.
+            Ok(BodyChunk::Data { bytes }) if bytes.is_empty() => {
+                if self.long_lived {
+                    Ok(liters::BodyRead::Idle)
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "http client returned an empty Data chunk on a non-long-lived body \
+                         (BodyChunk.Data must be non-empty; use Eof to end the body)",
+                    ))
+                }
+            }
             Ok(BodyChunk::Data { bytes }) => {
                 let n = bytes.len().min(buf.len());
                 buf[..n].copy_from_slice(&bytes[..n]);
@@ -930,6 +1007,13 @@ impl liters::TransportBody for ForeignBody {
                 }
                 Ok(liters::BodyRead::Bytes(n))
             }
+            // An explicit Idle on a non-long-lived body is the same contract
+            // violation, and the same answer.
+            Ok(BodyChunk::Idle) if !self.long_lived => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "http client returned BodyChunk.Idle on a non-long-lived body \
+                 (Idle is only valid for long_lived requests)",
+            )),
             Ok(BodyChunk::Idle) => Ok(liters::BodyRead::Idle),
             Ok(BodyChunk::Eof) => Ok(liters::BodyRead::Eof),
             // Preserve liters' in-stream taxonomy: InvalidData → protocol error
@@ -984,13 +1068,7 @@ impl LitersManager {
     /// Turns FFI storage into a core config, injecting the shared host HTTP
     /// transport when one was supplied and the storage is HTTP-backed.
     fn storage_config(&self, storage: Storage) -> liters::StorageConfig {
-        let mut cfg = storage.into_config();
-        if let (Some(transport), liters::StorageConfig::Http { transport: slot, .. }) =
-            (&self.http, &mut cfg)
-        {
-            *slot = Some(Arc::clone(transport));
-        }
-        cfg
+        storage.into_config_with(self.http.clone())
     }
 }
 
@@ -1153,6 +1231,7 @@ impl LitersManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use liters::TransportBody as _;
 
     #[test]
     fn error_mapping() {
@@ -1229,6 +1308,150 @@ mod tests {
         assert!(matches!(status.state, DbState::Working));
         assert_eq!(status.position, Some(7));
         assert_eq!(status.last_activity_ms, Some(99));
+    }
+
+    // ---- transport seam ----
+
+    /// A host client that never actually runs a request: enough to prove the
+    /// transport is *installed*, which is what the seam is for.
+    #[derive(Debug)]
+    struct NoopClient;
+    impl HttpClient for NoopClient {
+        fn execute(
+            &self,
+            _request: HttpRequest,
+            _body: Option<Arc<dyn HttpRequestBody>>,
+        ) -> Result<Arc<dyn HttpResponse>, HttpError> {
+            Err(HttpError::Transport { message: "not used in this test".into() })
+        }
+    }
+
+    /// `Storage::Http` must carry the host transport into the core config.
+    /// Before this, `into_config` hardcoded `transport: None` and only the
+    /// Manager patched it back in, so every `LitersWriter`/`LitersReplica`
+    /// built from `Storage::Http` silently used the built-in socket transport.
+    #[test]
+    fn http_storage_carries_the_host_transport() {
+        let storage =
+            || Storage::Http { url: "http://example.com".into(), auth_token: None };
+
+        match storage().into_config_with(None) {
+            liters::StorageConfig::Http { transport, .. } => assert!(transport.is_none()),
+            _ => panic!("wrong variant"),
+        }
+        match storage().into_config_with(foreign_transport(Some(Arc::new(NoopClient)))) {
+            liters::StorageConfig::Http { transport, .. } => assert!(
+                transport.is_some(),
+                "a host HttpClient must reach the core config, not just the Manager's"
+            ),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// The observable consequence: the built-in transport rejects `https://`
+    /// outright (it has no TLS), so before this fix a direct `LitersWriter`
+    /// could not use TLS at all — the transport seam was reachable only via
+    /// `LitersManager`.
+    #[test]
+    fn writer_accepts_https_only_with_a_host_transport() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("app.db");
+        rusqlite::Connection::open(&db).unwrap().execute_batch("CREATE TABLE t(x)").unwrap();
+        let storage =
+            || Storage::Http { url: "https://example.com".into(), auth_token: None };
+
+        let err = match LitersWriter::new(db.to_string_lossy().into_owned(), storage()) {
+            Err(e) => e,
+            Ok(_) => panic!("built-in transport must refuse https, not downgrade it"),
+        };
+        assert!(format!("{err}").contains("https"), "error should name the cause: {err}");
+
+        if let Err(e) = LitersWriter::new_with_http_client(
+            db.to_string_lossy().into_owned(),
+            storage(),
+            Some(Arc::new(NoopClient)),
+        ) {
+            panic!("with a host transport, https must be accepted; got: {e}");
+        }
+    }
+
+    // ---- ForeignBody contract ----
+
+    /// Replays a scripted sequence of `read_body` results.
+    struct ScriptedResponse(Mutex<Vec<Result<BodyChunk, HttpError>>>);
+    impl HttpResponse for ScriptedResponse {
+        fn status(&self) -> u16 {
+            200
+        }
+        fn headers(&self) -> Vec<HttpHeader> {
+            Vec::new()
+        }
+        fn read_body(&self, _max: u32) -> Result<BodyChunk, HttpError> {
+            let mut q = plock(&self.0);
+            if q.is_empty() {
+                Ok(BodyChunk::Eof)
+            } else {
+                q.remove(0)
+            }
+        }
+        fn cancel(&self) {}
+    }
+
+    fn body(long_lived: bool, script: Vec<Result<BodyChunk, HttpError>>) -> ForeignBody {
+        ForeignBody {
+            resp: Arc::new(ScriptedResponse(Mutex::new(script))),
+            leftover: Vec::new(),
+            long_lived,
+        }
+    }
+
+    /// `BodyRead::Idle` is documented "Never produced for a non-long_lived
+    /// body", and a non-long-lived reader has no idle timeout — so mapping a
+    /// (contract-violating) empty `Data` to `Idle` there would spin on a stream
+    /// that may already be dead. It has to be a protocol error.
+    #[test]
+    fn empty_data_is_an_error_on_a_non_long_lived_body() {
+        let mut buf = [0u8; 16];
+        let mut b = body(false, vec![Ok(BodyChunk::Data { bytes: Vec::new() })]);
+        match b.read(&mut buf) {
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
+            Ok(_) => panic!("empty Data must not become Idle on a non-long-lived body"),
+        }
+
+        let mut b = body(false, vec![Ok(BodyChunk::Idle)]);
+        match b.read(&mut buf) {
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
+            Ok(_) => panic!("explicit Idle is the same contract violation"),
+        }
+    }
+
+    /// On a long-lived body an idle tick is exactly what the seam is for, in
+    /// either spelling.
+    #[test]
+    fn idle_is_allowed_on_a_long_lived_body() {
+        let mut buf = [0u8; 16];
+        let mut b = body(
+            true,
+            vec![Ok(BodyChunk::Data { bytes: Vec::new() }), Ok(BodyChunk::Idle)],
+        );
+        assert!(matches!(b.read(&mut buf), Ok(liters::BodyRead::Idle)));
+        assert!(matches!(b.read(&mut buf), Ok(liters::BodyRead::Idle)));
+    }
+
+    /// Regression guard for the paths the change touches: real data still
+    /// streams, over-long chunks still leave a remainder, and Eof still ends.
+    #[test]
+    fn data_and_eof_are_unchanged() {
+        let mut buf = [0u8; 4];
+        let mut b = body(
+            false,
+            vec![Ok(BodyChunk::Data { bytes: b"abcdef".to_vec() }), Ok(BodyChunk::Eof)],
+        );
+        assert!(matches!(b.read(&mut buf), Ok(liters::BodyRead::Bytes(4))));
+        assert_eq!(&buf, b"abcd");
+        assert!(matches!(b.read(&mut buf), Ok(liters::BodyRead::Bytes(2))));
+        assert_eq!(&buf[..2], b"ef");
+        assert!(matches!(b.read(&mut buf), Ok(liters::BodyRead::Eof)));
     }
 
     #[test]
