@@ -270,9 +270,32 @@ impl LitersWriter {
 #[uniffi::export]
 impl LitersWriter {
     /// Opens a writer for an existing SQLite database. Switches the database
-    /// to WAL mode and takes over checkpointing (do not run your own
-    /// `wal_checkpoint`; `wal_autocheckpoint` on your connections is fine —
-    /// it will simply never fire while the writer holds its read lock).
+    /// to WAL mode and takes over checkpointing: do not run your own
+    /// `wal_checkpoint`, and **set `wal_autocheckpoint = 0` on every
+    /// connection your app opens to this database**.
+    ///
+    /// That second half is not optional on mobile, which is the platform this
+    /// crate exists for. The writer's read lock does starve a foreign
+    /// autocheckpoint *while it is held* — but `LitersManager.sleep()` (and
+    /// dropping the writer, and the app being killed) releases it, by design:
+    /// see `Manager::sleep`, which "drops its Writer — releasing the
+    /// WAL-pinning read transaction and every fd — and parks with zero storage
+    /// traffic". On iOS that is most of the app's life. A foreign
+    /// autocheckpoint that fires in that window restarts the WAL, and the next
+    /// push finds its resume frame gone: `verify()` reports "wal truncated by
+    /// another process" or "wal overwritten by another process" and recovers
+    /// the only way it can, by writing a **full snapshot of the database**.
+    ///
+    /// Note also that `wal_autocheckpoint` is a per-*connection* setting, so a
+    /// connection pool must apply it to every connection it opens, not once at
+    /// startup.
+    ///
+    /// Turning autocheckpoint off makes liters the only checkpointer, which is
+    /// the intent — but liters' own thresholds
+    /// (`WriterOptions::min_checkpoint_page_n`, `truncate_page_n`) live inside
+    /// `push()`. If pushes stop, nothing checkpoints and the WAL grows without
+    /// bound, so an app that disables autocheckpoint should also keep its own
+    /// size floor on the `-wal` file.
     ///
     /// Performs no network I/O: opening succeeds offline, and pushes
     /// accumulate local L0 files until the bucket becomes reachable (the
