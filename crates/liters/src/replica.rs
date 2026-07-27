@@ -1,13 +1,18 @@
 //! The read side: a local, read-only materialization of a replica bucket,
 //! kept current by applying LTX files incrementally. Ports litestream's
-//! restore + follow machinery (replica.go:544-994) with two hardening
+//! restore + follow machinery (replica.go:544-994) with three hardening
 //! changes for mobile:
 //!
 //! - every fetched file's CRC is verified *before* its pages touch the live
 //!   replica (litestream verifies after writing);
 //! - a stalled L0/L1-8 chain falls back to applying a newer snapshot in
 //!   place, and a bucket whose max TXID went backwards is detected as
-//!   divergence (litestream's follow mode stalls forever on both).
+//!   divergence (litestream's follow mode stalls forever on both);
+//! - the replica-file lock is acquired with a deadline and a cancellation
+//!   check instead of blocking forever (internal/lock_unix.go:48 uses
+//!   `F_SETLKW`). A daemon on a server can be restarted when a reader wedges
+//!   it; a library inside someone's app cannot, and a concurrent reader
+//!   process is the normal case there. See [`FcntlLock`].
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
@@ -38,6 +43,20 @@ pub struct ReplicaOptions {
     /// so same-process readers must not hold read transactions across
     /// `sync()`.
     pub use_file_locks: bool,
+    /// How long to wait for those locks before giving up with
+    /// [`Error::LockBusy`]. Only reached when `use_file_locks` is set and a
+    /// reader in another process holds a conflicting lock; an uncontended
+    /// acquisition never consults it.
+    ///
+    /// This is a bound, not a target: acquisition returns the instant the
+    /// lock is free, and cancellation is observed within ~20ms regardless of
+    /// how long the bound is. Zero means try once and fail immediately, like
+    /// SQLite with `busy_timeout=0`. Values above a day are clamped.
+    ///
+    /// The default matches the usual SQLite `busy_timeout` convention: long
+    /// enough to sit out an ordinary read transaction, short enough that a
+    /// wedged reader is reported rather than waited on forever.
+    pub lock_timeout: Duration,
     /// On divergence (bucket reseeded below our position) or unresumable
     /// local state, restore from scratch instead of returning
     /// [`Error::Diverged`]. The restore materializes to a temp file and
@@ -51,6 +70,7 @@ impl Default for ReplicaOptions {
         ReplicaOptions {
             integrity_check: IntegrityCheck::Quick,
             use_file_locks: true,
+            lock_timeout: Duration::from_secs(5),
             auto_reset: false,
         }
     }
@@ -138,12 +158,20 @@ impl Replica {
     }
 
     /// [`Replica::sync`], cancellable: the token is installed on the storage
-    /// client and checked between fetched files — never mid-apply. A started
-    /// page application always runs to completion: a torn apply is healed by
-    /// re-apply anyway, but deliberately widening that window buys nothing.
+    /// client and checked between fetched files, and while waiting for the
+    /// replica file lock — but never mid-apply. A started page application
+    /// always runs to completion: a torn apply is healed by re-apply anyway,
+    /// but deliberately widening that window buys nothing. Waiting for the
+    /// lock is not mid-apply — it happens before the first page is written,
+    /// so nothing is torn by giving up there.
     /// A cancelled sync returns [`Error::Cancelled`]; the local replica is
     /// exactly as consistent as after a kill (tmp spools removed, position
     /// sidecar only ever advanced after a completed apply).
+    ///
+    /// If a reader in another process holds a conflicting lock on the replica
+    /// for longer than [`ReplicaOptions::lock_timeout`], the sync returns
+    /// [`Error::LockBusy`] rather than blocking indefinitely. Nothing was
+    /// applied and the sync is safe to retry.
     pub fn sync_with(&mut self, cancel: &CancelToken) -> Result<SyncResult> {
         self.client.set_cancel(cancel.clone());
 
@@ -196,7 +224,15 @@ impl Replica {
     /// [`Error::Cancelled`] — normally observed within ~a second (or after
     /// the in-flight file finishes applying); the worst case is the stream
     /// dead-man bound (~45s) if a frame stalls mid-transfer on a dead link
-    /// and the backend is not token-aware.
+    /// and the backend is not token-aware. A follower waiting on a replica
+    /// file lock held by another process is *not* part of that worst case:
+    /// it notices the cancel within ~20ms, whatever
+    /// [`ReplicaOptions::lock_timeout`] is set to.
+    ///
+    /// A lock held past that timeout surfaces as a transient
+    /// [`Error::LockBusy`]: with `retry` set the follower backs off and picks
+    /// up again once the reader commits; with `retry: None` it returns the
+    /// error, like any other failed round.
     pub fn follow(&mut self, cancel: &CancelToken, opts: &FollowOptions) -> Result<()> {
         self.client.set_cancel(cancel.clone());
 
@@ -294,7 +330,7 @@ impl Replica {
                             break Some(e.into());
                         }
                         drop(spool);
-                        match self.apply_spooled(&db, &spool_path, page_size) {
+                        match self.apply_spooled(&db, &spool_path, page_size, cancel) {
                             Ok(()) => {
                                 position = info.max_txid;
                                 if let Err(e) = write_txid_file(&self.db_path, position) {
@@ -459,7 +495,7 @@ impl Replica {
             if info.max_txid <= current {
                 continue;
             }
-            match self.apply_ltx_file(&f, &info, page_size) {
+            match self.apply_ltx_file(&f, &info, page_size, cancel) {
                 Ok(()) => current = info.max_txid,
                 // A listed file may 404 mid-race with compaction/GC:
                 // re-list next sync; never advance past it. (resumable_reader.go:75)
@@ -528,7 +564,7 @@ impl Replica {
             if let Some(snap) = newest_snapshot {
                 if snap.max_txid > current {
                     cancel.check()?;
-                    self.apply_ltx_file(f, &snap, page_size)?;
+                    self.apply_ltx_file(f, &snap, page_size, cancel)?;
                     current = snap.max_txid;
                 }
             }
@@ -561,7 +597,7 @@ impl Replica {
                     continue;
                 }
                 cancel.check()?;
-                match self.apply_ltx_file(f, &info, page_size) {
+                match self.apply_ltx_file(f, &info, page_size, cancel) {
                     Ok(()) => current = info.max_txid,
                     Err(Error::Storage(StorageError::NotFound { .. })) => {
                         *saw_404 = true;
@@ -583,7 +619,13 @@ impl Replica {
 
     /// Applies one LTX file's pages to the replica in place: fetches to the
     /// spool file, then [`Replica::apply_spooled`]. (replica.go:879-930)
-    fn apply_ltx_file(&mut self, f: &File, info: &FileInfo, page_size: u32) -> Result<()> {
+    fn apply_ltx_file(
+        &mut self,
+        f: &File,
+        info: &FileInfo,
+        page_size: u32,
+        cancel: &CancelToken,
+    ) -> Result<()> {
         let spool_path = tmp_sibling(&self.db_path, ".apply.tmp");
         let _cleanup = TmpGuard(&spool_path);
         {
@@ -592,7 +634,7 @@ impl Replica {
             std::io::copy(&mut rc, &mut spool)?;
             spool.sync_all()?;
         }
-        self.apply_spooled(f, &spool_path, page_size)
+        self.apply_spooled(f, &spool_path, page_size, cancel)
     }
 
     /// Applies one complete, already-spooled LTX file. The spool is
@@ -600,7 +642,13 @@ impl Replica {
     /// which verifies after). Page 1 gets the journal mode + change counter
     /// fixups; the file is truncated to the commit size. Shared by the
     /// fetch-by-listing path and streaming follow.
-    fn apply_spooled(&mut self, f: &File, spool_path: &Path, page_size: u32) -> Result<()> {
+    fn apply_spooled(
+        &mut self,
+        f: &File,
+        spool_path: &Path,
+        page_size: u32,
+        cancel: &CancelToken,
+    ) -> Result<()> {
         {
             let dec = Decoder::new(BufReader::new(File::open(spool_path)?));
             dec.verify()?;
@@ -615,7 +663,13 @@ impl Replica {
             return Err(Error::Diverged { local: hdr.min_txid, remote: hdr.max_txid });
         }
 
-        let _lock = if self.opts.use_file_locks { Some(FcntlLock::exclusive(f)?) } else { None };
+        // Taken before the first page is written, so a `LockBusy` or
+        // `Cancelled` here leaves the replica untouched.
+        let _lock = if self.opts.use_file_locks {
+            Some(FcntlLock::exclusive(f, self.opts.lock_timeout, cancel)?)
+        } else {
+            None
+        };
 
         let mut data = vec![0u8; page_size as usize];
         while let Some(phdr) = dec.decode_page(&mut data)? {
@@ -660,6 +714,17 @@ impl Replica {
 
 /// SQLite-compatible exclusive byte-range locks on the replica file, taken
 /// for the duration of a page application. (internal/lock_unix.go)
+///
+/// Acquisition is deadline-bounded and cancellable. It used to be neither:
+/// both ranges were taken with `F_SETLKW`, which blocks in the kernel with
+/// no timeout and no interruption point, so a single reader process holding
+/// a SQLite transaction against the replica could wedge replication forever
+/// — `cancel()` sets a flag that nothing in a blocked `fcntl` ever reads,
+/// and the blocked thread is also what `Manager::unregister` joins on. A
+/// concurrent reader is the normal case on the embedded hosts liters targets
+/// (an iOS or Android app reading the replica while a worker follows it), so
+/// the wait is now `F_SETLK` (the non-blocking command) on a poll schedule
+/// that re-checks the token between attempts.
 struct FcntlLock<'a> {
     f: &'a File,
 }
@@ -668,40 +733,146 @@ const SQLITE_PENDING_BYTE: i64 = 0x4000_0000;
 const SQLITE_SHARED_FIRST: i64 = SQLITE_PENDING_BYTE + 2;
 const SQLITE_SHARED_SIZE: i64 = 510;
 
-fn set_fcntl_lock(f: &File, lock_type: libc::c_short, start: i64, len: i64) -> Result<()> {
+/// One of the two byte ranges SQLite's locking protocol uses. Named so a
+/// failure can say *which* range was contended.
+#[derive(Clone, Copy)]
+struct LockRange {
+    name: &'static str,
+    start: i64,
+    len: i64,
+}
+
+/// Held by a writer to stop *new* readers from starting.
+const PENDING_RANGE: LockRange =
+    LockRange { name: "PENDING", start: SQLITE_PENDING_BYTE, len: 1 };
+/// Read-locked by every reader; write-locking it is what EXCLUSIVE means.
+const SHARED_RANGE: LockRange =
+    LockRange { name: "SHARED", start: SQLITE_SHARED_FIRST, len: SQLITE_SHARED_SIZE };
+
+/// Poll schedule while a lock is contended: doubling from 1ms up to a 20ms
+/// ceiling. The ceiling bounds both the delay after the holder releases and
+/// the latency of noticing cancellation; the 1ms floor keeps a brief
+/// overlap (the common case) cheap.
+const LOCK_POLL_MIN: Duration = Duration::from_millis(1);
+const LOCK_POLL_MAX: Duration = Duration::from_millis(20);
+
+/// Ceiling on [`ReplicaOptions::lock_timeout`], so a nonsense value cannot
+/// overflow the deadline arithmetic. Even here the wait stays cancellable.
+const LOCK_TIMEOUT_MAX: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// One `fcntl(F_SETLK)` — the non-blocking command. A conflicting lock in
+/// another process is reported as `EAGAIN`/`EACCES` rather than parking the
+/// thread. `F_UNLCK` never conflicts, so releasing is a single call.
+fn set_fcntl_lock(f: &File, lock_type: libc::c_short, r: LockRange) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
     let fl = libc::flock {
-        l_start: start,
-        l_len: len,
+        l_start: r.start,
+        l_len: r.len,
         l_pid: 0,
         l_type: lock_type,
         l_whence: libc::SEEK_SET as libc::c_short,
     };
-    let rc = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETLKW, &fl) };
+    let rc = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETLK, &fl) };
     if rc == -1 {
-        return Err(Error::Io(std::io::Error::last_os_error()));
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
 
-impl<'a> FcntlLock<'a> {
-    fn exclusive(f: &'a File) -> Result<FcntlLock<'a>> {
-        set_fcntl_lock(f, libc::F_WRLCK as libc::c_short, SQLITE_PENDING_BYTE, 1)?;
-        if let Err(e) =
-            set_fcntl_lock(f, libc::F_WRLCK as libc::c_short, SQLITE_SHARED_FIRST, SQLITE_SHARED_SIZE)
-        {
-            let _ = set_fcntl_lock(f, libc::F_UNLCK as libc::c_short, SQLITE_PENDING_BYTE, 1);
-            return Err(e);
+/// "Another process holds a conflicting lock" — the one `F_SETLK` failure
+/// worth retrying. POSIX allows either errno here, so both are matched.
+fn is_lock_contention(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::EAGAIN) | Some(libc::EACCES))
+}
+
+/// `fcntl(F_GETLK)`: the pid of a process holding a lock that would block
+/// this request. Diagnostics only, and inherently racy — the holder may
+/// release between the failed `F_SETLK` and this probe — so every failure
+/// mode collapses to `None`.
+fn conflicting_pid(f: &File, lock_type: libc::c_short, r: LockRange) -> Option<i32> {
+    use std::os::unix::io::AsRawFd;
+    let mut fl = libc::flock {
+        l_start: r.start,
+        l_len: r.len,
+        l_pid: 0,
+        l_type: lock_type,
+        l_whence: libc::SEEK_SET as libc::c_short,
+    };
+    let rc = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETLK, &mut fl) };
+    if rc == -1 || fl.l_type == libc::F_UNLCK as libc::c_short {
+        return None;
+    }
+    // Linux reports -1 for open-file-description locks, which name no single
+    // owning process.
+    (fl.l_pid > 0).then_some(fl.l_pid)
+}
+
+/// Write-locks one range, retrying for as long as another process holds a
+/// conflicting lock.
+///
+/// Returns the moment the lock is ours. Gives up with [`Error::Cancelled`]
+/// as soon as `cancel` flips and with [`Error::LockBusy`] at `deadline`,
+/// whichever comes first. An uncontended acquisition issues exactly one
+/// `fcntl` and never sleeps, so the fast path is what the old `F_SETLKW`
+/// did, instruction for instruction.
+fn acquire_write_lock(
+    f: &File,
+    r: LockRange,
+    deadline: Instant,
+    cancel: &CancelToken,
+) -> Result<()> {
+    const WRLCK: libc::c_short = libc::F_WRLCK as libc::c_short;
+    let began = Instant::now();
+    let mut delay = LOCK_POLL_MIN;
+    loop {
+        match set_fcntl_lock(f, WRLCK, r) {
+            Ok(()) => return Ok(()),
+            Err(e) if is_lock_contention(&e) => {}
+            Err(e) => return Err(Error::Io(e)),
         }
-        Ok(FcntlLock { f })
+        // Cancellation outranks the deadline: a caller that asked us to stop
+        // gets `Cancelled`, not a contention report it never waited for.
+        cancel.check()?;
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(Error::LockBusy {
+                lock: r.name,
+                waited: began.elapsed(),
+                holder_pid: conflicting_pid(f, WRLCK, r),
+            });
+        }
+        std::thread::sleep(delay.min(left));
+        delay = (delay * 2).min(LOCK_POLL_MAX);
+    }
+}
+
+impl<'a> FcntlLock<'a> {
+    /// Takes SQLite's EXCLUSIVE pair — PENDING, then the SHARED range —
+    /// under one shared deadline, checking `cancel` between attempts.
+    ///
+    /// PENDING is held across the SHARED retries rather than dropped and
+    /// re-taken between them. That is what the old blocking `F_SETLKW` on
+    /// SHARED did implicitly, and it is load-bearing: holding PENDING stops
+    /// *new* readers from starting, so the readers already inside drain and
+    /// the applier is guaranteed to get in. Releasing it each round would
+    /// let a steady stream of arriving readers starve the applier until the
+    /// deadline, every time.
+    fn exclusive(f: &'a File, timeout: Duration, cancel: &CancelToken) -> Result<FcntlLock<'a>> {
+        let deadline = Instant::now() + timeout.min(LOCK_TIMEOUT_MAX);
+        acquire_write_lock(f, PENDING_RANGE, deadline, cancel)?;
+        // PENDING is ours from here: bind the guard before the second
+        // acquisition so every exit path, `?` included, releases it.
+        let guard = FcntlLock { f };
+        acquire_write_lock(f, SHARED_RANGE, deadline, cancel)?;
+        Ok(guard)
     }
 }
 
 impl Drop for FcntlLock<'_> {
     fn drop(&mut self) {
-        let _ =
-            set_fcntl_lock(self.f, libc::F_UNLCK as libc::c_short, SQLITE_SHARED_FIRST, SQLITE_SHARED_SIZE);
-        let _ = set_fcntl_lock(self.f, libc::F_UNLCK as libc::c_short, SQLITE_PENDING_BYTE, 1);
+        const UNLCK: libc::c_short = libc::F_UNLCK as libc::c_short;
+        let _ = set_fcntl_lock(self.f, UNLCK, SHARED_RANGE);
+        let _ = set_fcntl_lock(self.f, UNLCK, PENDING_RANGE);
     }
 }
 

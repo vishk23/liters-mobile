@@ -54,3 +54,6 @@ s3 = ["liters-storage/s3"]
 tempfile = { workspace = true }
 proptest = { workspace = true }
 liters-storage = { workspace = true, features = ["s3", "http"] }
+# Already a normal dependency; repeated here so integration tests can take
+# the same raw fcntl locks the applier does (tests/replica_lock.rs).
+libc = "0.2"

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use ltx::Txid;
 
 /// Errors from liters replication.
@@ -40,6 +42,35 @@ pub enum Error {
     #[error("transaction not available")]
     TxNotAvailable,
 
+    /// A conflicting `fcntl` lock on the replica file outlived
+    /// [`ReplicaOptions::lock_timeout`](crate::ReplicaOptions::lock_timeout),
+    /// so the applier gave up instead of waiting indefinitely. The holder is
+    /// another *process* — POSIX record locks never conflict within one
+    /// process — typically a reader with an open SQLite transaction against
+    /// the replica.
+    ///
+    /// Nothing was written: the lock is taken before the first page, so the
+    /// local replica and its position sidecar are exactly as they were. The
+    /// sync is safe to retry, and [`Error::is_transient`] reports it as
+    /// retryable so a `follow` loop with a `retry` backoff resumes on its own
+    /// once the reader commits.
+    ///
+    /// `holder_pid` is a best-effort `F_GETLK` probe: `None` when the kernel
+    /// named no owner (Linux open-file-description locks report none) or the
+    /// holder released in the interim.
+    #[error("replica file lock busy: could not take the SQLite {lock} lock within {waited:?}{}",
+            .holder_pid.map(|p| format!(" (conflicting lock held by pid {p})")).unwrap_or_default())]
+    LockBusy {
+        /// Which of SQLite's two lock ranges was contended: `"PENDING"` or
+        /// `"SHARED"`.
+        lock: &'static str,
+        /// How long acquisition of that range was attempted before giving up.
+        waited: Duration,
+        /// PID of a process holding a conflicting lock, if the kernel
+        /// reported one.
+        holder_pid: Option<i32>,
+    },
+
     /// The operation was cancelled via a
     /// [`CancelToken`](liters_storage::CancelToken).
     #[error("operation cancelled")]
@@ -63,13 +94,14 @@ impl From<liters_storage::StorageError> for Error {
 impl Error {
     /// Whether retrying the same operation later can plausibly succeed:
     /// transient storage failures (per
-    /// [`StorageError::is_transient`](liters_storage::StorageError::is_transient))
-    /// and local I/O hiccups. Divergence, integrity errors, and cancellation
+    /// [`StorageError::is_transient`](liters_storage::StorageError::is_transient)),
+    /// local I/O hiccups, and a busy replica-file lock (the holding reader
+    /// commits eventually). Divergence, integrity errors, and cancellation
     /// are never transient.
     pub fn is_transient(&self) -> bool {
         match self {
             Error::Storage(e) => e.is_transient(),
-            Error::Io(_) => true,
+            Error::Io(_) | Error::LockBusy { .. } => true,
             _ => false,
         }
     }
