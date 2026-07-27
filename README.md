@@ -1,3 +1,99 @@
+# liters-mobile
+
+**A derivative of [`mrkurt/liters`](https://github.com/mrkurt/liters), by Kurt
+Mackey.**
+
+Kurt wrote liters: the LTX v0.5 codec, the SQLite WAL reader, the storage
+backends, the `Writer`/`Replica`/`Manager` surface, the liters HTTP replication
+protocol, and the UniFFI bindings. That is the substantial majority of the code
+in this repository. His commits are preserved here unmodified — same SHAs, same
+authorship, same dates; run `git log 108e1df` to read the original history, and
+`git log --author=mrkurt` to see how much of this is his. The code is
+MIT-licensed and is used here with his permission; `LICENSE` carries his
+copyright.
+
+This repository exists for one practical reason. Upstream review is paused
+while Kurt is on sabbatical, and the mobile-embedding work below needs
+somewhere to keep moving in the meantime. It is not a competing project and not
+a hard fork: the changes here are written to go back upstream, and two of them
+are already proposed there — [mrkurt/liters#2](https://github.com/mrkurt/liters/pull/2)
+and [mrkurt/liters#3](https://github.com/mrkurt/liters/pull/3) — from
+[vishk23/liters](https://github.com/vishk23/liters), the GitHub fork that stays
+the vehicle for upstream PRs. **If you want liters itself, go to
+[mrkurt/liters](https://github.com/mrkurt/liters).**
+
+## What this adds beyond upstream
+
+`main` is upstream [`108e1df`](https://github.com/mrkurt/liters/commit/108e1df)
+plus four changes, each developed on its own branch and merged with its history
+intact. All four are behaviour-compatible with upstream on the default build.
+
+**Optional SQLite bundling** — `sqlite-linkage-feature`, [`3919cc7`], upstream
+[#3](https://github.com/mrkurt/liters/pull/3). `rusqlite`'s `bundled` feature
+was hardcoded in `[workspace.dependencies]`, and workspace dependency features
+are additive — a member cannot remove them — so linking the *platform* SQLite
+was impossible tree-wide. This moves the choice into a `bundled-sqlite` feature
+(on by default, so nothing changes for existing users) with a
+`system-sqlite-bindgen` companion, re-exported through `liters-ffi`, and teaches
+`scripts/build-ios.sh` a `SQLITE=bundled|system|system-bindgen` switch applied
+to the device, simulator *and* bindings builds. This is the change that lets an
+iOS app link **one** SQLite instead of two: an app using GRDB already links
+Apple's system `libsqlite3`, and a second copy in the same process keeps its own
+`unixInodeInfo` table and can silently drop the first copy's advisory locks —
+which for liters is a correctness bug, not just a hazard, because the writer's
+guarantee that no foreign checkpointer restarts the WAL under it *is* a
+long-running read lock. See the [SQLite linkage](#sqlite-linkage--bundled-sqlite)
+section below.
+
+**Per-push snapshot/bytes telemetry** — `push-snapshot-telemetry`, [`194d8f9`].
+`verify()` already decided per push whether a full snapshot was required
+instead of an incremental WAL delta, and already recorded why, but nothing read
+it and neither the flag nor the reason reached `PushResult`. A caller could not
+distinguish a 400-byte delta from a whole-database upload except by watching
+byte counts and guessing. `PushResult` (and FFI `PushSummary`) now carry
+`snapshotted`, `snapshot_reason` (a small fixed set, so it aggregates), and
+`bytes_uploaded`. No behaviour change — the values come from state that already
+existed. This makes "is liters viable on this device?" an empirically
+answerable question rather than one needing a patched crate.
+
+**FFI transport and body fixes** — `ffi-transport-and-body`, [`0c6ae0f`]. Two
+independent bugs on the FFI's HTTP path. `Storage::into_config()` hardcoded
+`transport: None` and only `LitersManager` patched a host transport back in, so
+a plain `LitersWriter`/`LitersReplica` always ran on the built-in socket
+transport — which refuses `https://` outright and cannot hand a transfer to a
+background `URLSession`, meaning an iOS upload in flight at suspend was simply
+lost. `into_config_with(transport)` plus `new_with_http_client` constructors fix
+it. Separately, `ForeignBody::read` mapped an empty `BodyChunk::Data` to
+`BodyRead::Idle` on *every* request, violating `Idle`'s documented
+long-lived-only contract and spinning on a possibly-dead stream instead of
+raising an error the caller can act on.
+
+**Documentation corrections and LICENSE** — `docs-and-license`, [`4491124`],
+upstream [#2](https://github.com/mrkurt/liters/pull/2). Adds the MIT `LICENSE`
+file and aligns `Cargo.toml` (which said Apache-2.0 against a stated MIT
+intent), then corrects four in-tree claims that disagree with their own cited
+sources: the LZ4 frame settings attributed to `ltx encoder.go` (two of the four
+are pierrec/lz4 defaults, not set at that call site — and they are
+load-bearing), "byte-compatible with superfly/ltx v0.5.1" (it cannot be, by
+construction, since compressed sizes move the page index and hence the file
+checksum — "format-compatible" is accurate and is what the oracle suite
+asserts), `PageHeader::flags` "reserved; must be zero" (already outdated on ltx
+`main`), and an FFI claim that a foreign `wal_autocheckpoint` can never fire —
+true only while the read lock is held, which `Manager::sleep` releases by
+design, i.e. most of an iOS app's life. No behaviour change.
+
+## Status
+
+Verified on the integrated `main` (2026-07-27, rustc 1.97.1):
+
+```
+cargo test --workspace                                    195 passed, 0 failed
+cargo clippy --workspace --all-targets -- -D warnings      clean (exit 0)
+cargo build -p liters-ffi --no-default-features             ok (system SQLite)
+```
+
+---
+
 # liters
 
 A Rust library, embeddable in iOS/Android apps, that reads and writes
