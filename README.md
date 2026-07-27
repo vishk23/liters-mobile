@@ -92,6 +92,12 @@ cargo clippy --workspace --all-targets -- -D warnings      clean (exit 0)
 cargo build -p liters-ffi --no-default-features             ok (system SQLite)
 ```
 
+Run `make reference` once after cloning — it fetches the pinned litestream
+checkout into `reference/`, which is not in the repo and which the wal-reader
+fixture tests read testdata from. It needs git only, not Go, and `make test`
+runs it for you. Without it those tests skip. See
+[Compatibility](#compatibility).
+
 ---
 
 # liters
@@ -354,9 +360,15 @@ asserts, among others, that
 - the reader follows buckets written by live `litestream replicate`,
   surviving compaction races, pruned levels, and bucket reseeds.
 
-Run everything with `make test` (Go toolchain required for the oracle; tests
-skip gracefully without it). `docs/research/` holds the format/internals
-notes the implementation was built from.
+Run everything with `make test`. It first runs `make reference`, which fetches
+the pinned litestream checkout (`LITESTREAM_REF` in the `Makefile`) into
+`reference/` — untracked, git-only, no Go — then builds the oracle binaries and
+runs the suite. Two groups of tests degrade to a `SKIP:` notice rather than
+failing: the oracle-backed ones without a Go toolchain, and the wal-reader
+fixture tests without that checkout, since they read litestream's own testdata
+out of it. Plain `cargo test --workspace` therefore wants `make reference` to
+have run at least once. `docs/research/` holds the format/internals notes the
+implementation was built from.
 
 ## Design notes
 

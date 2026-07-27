@@ -1,5 +1,11 @@
 # liters build helpers.
 #
+# `make reference` fetches the pinned benbjohnson/litestream checkout into
+# reference/litestream, which is not in the repo (reference/.gitignore keeps
+# the directory but ignores its contents). Two things need it: the wal-reader
+# fixture tests, which read testdata straight out of it, and `make oracle`,
+# which builds the litestream CLI from it. Git is the only prerequisite.
+#
 # `make oracle` builds the Go reference binaries used by the interop test
 # suite ("the oracle"): the litestream CLI from reference/litestream and the
 # ltx CLI at the exact version litestream pins. Tests locate them via
@@ -11,7 +17,23 @@ LTX_CLI    := $(ORACLE_DIR)/ltx
 HELPER     := $(ORACLE_DIR)/oracle-helper
 LTX_VERSION := v0.5.1
 
-.PHONY: oracle test clean-oracle
+REFERENCE_DIR := $(CURDIR)/reference/litestream
+# Commit of benbjohnson/litestream the suite is validated against (v0.5.14 + 1).
+# Defined here only: .github/workflows/test.yml fetches the checkout by running
+# `make reference`, so CI and a local clone can never drift to different refs.
+LITESTREAM_REF := c96c0f42a51bf48a40e13a1569a46312e957b429
+
+.PHONY: oracle reference test clean-oracle clean-reference
+
+# Idempotent: re-fetches only when the checkout is missing or off the pin,
+# so bumping LITESTREAM_REF above is enough to move it.
+reference:
+	@if [ "$$(git -C $(REFERENCE_DIR) rev-parse HEAD 2>/dev/null)" != "$(LITESTREAM_REF)" ]; then \
+		echo "fetching litestream $(LITESTREAM_REF) into $(REFERENCE_DIR)"; \
+		git init -q $(REFERENCE_DIR); \
+		git -C $(REFERENCE_DIR) fetch -q --depth 1 https://github.com/benbjohnson/litestream $(LITESTREAM_REF); \
+		git -C $(REFERENCE_DIR) checkout -q FETCH_HEAD; \
+	fi
 
 oracle: $(LITESTREAM) $(LTX_CLI) $(HELPER)
 
@@ -19,7 +41,10 @@ $(HELPER): tests/oracle-helper/main.go tests/oracle-helper/go.mod
 	mkdir -p $(ORACLE_DIR)
 	cd tests/oracle-helper && go build -o $(HELPER) .
 
-$(LITESTREAM): $(wildcard reference/litestream/*.go) reference/litestream/go.mod
+# Order-only dep on the (phony) fetch: the checkout must exist first, but its
+# presence must not relink the binary on every invocation. The wildcard is
+# empty before the first fetch and picks up the sources after it.
+$(LITESTREAM): $(wildcard reference/litestream/*.go reference/litestream/go.mod) | reference
 	mkdir -p $(ORACLE_DIR)
 	cd reference/litestream && go build -o $(LITESTREAM) ./cmd/litestream
 
@@ -27,8 +52,20 @@ $(LTX_CLI):
 	mkdir -p $(ORACLE_DIR)
 	GOBIN=$(ORACLE_DIR) go install github.com/superfly/ltx/cmd/ltx@$(LTX_VERSION)
 
-test: oracle
+# The reference checkout is mandatory (git-only, and the fixture tests read it
+# directly); the oracle is best-effort, so that `make test` on a machine
+# without Go still runs the suite with the oracle-backed tests skipping, as
+# documented. `make oracle` on its own stays strict.
+test: reference
+	@if command -v go >/dev/null 2>&1; then \
+		$(MAKE) oracle; \
+	else \
+		echo "note: no Go toolchain; skipping the oracle build (oracle-backed tests will print SKIP)"; \
+	fi
 	LITERS_ORACLE_DIR=$(ORACLE_DIR) cargo test --workspace
 
 clean-oracle:
 	rm -rf $(ORACLE_DIR)
+
+clean-reference:
+	rm -rf $(REFERENCE_DIR)
