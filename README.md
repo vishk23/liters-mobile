@@ -26,7 +26,12 @@ the vehicle for upstream PRs. **If you want liters itself, go to
 
 `main` is upstream [`108e1df`](https://github.com/mrkurt/liters/commit/108e1df)
 plus four changes, each developed on its own branch and merged with its history
-intact. All four are behaviour-compatible with upstream on the default build.
+intact. All four are behaviour-compatible with upstream on the default build. A
+fifth branch, `reference-checkout-fetch`, fixes the build rather than the
+library: a fresh clone could run neither `cargo test --workspace` nor
+`make test`, because the pinned litestream checkout the wal-reader fixture
+tests read from was fetched only by CI. `make reference` now fetches it, and
+CI calls that same target.
 
 **Optional SQLite bundling** — `sqlite-linkage-feature`, [`3919cc7`], upstream
 [#3](https://github.com/mrkurt/liters/pull/3). `rusqlite`'s `bundled` feature
