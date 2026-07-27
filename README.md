@@ -42,6 +42,42 @@ r.sync()?;                                  // restore on first call, then incre
 | `liters` | `Writer` (push pipeline, checkpointing, device-side compaction/retention), `Replica` (restore + incremental follow), and `Manager` (background replication for N databases with sleep/resume) |
 | `liters-ffi` | UniFFI bindings for Swift/Kotlin: `LitersWriter`, `LitersReplica`, `LitersManager` + event listener (`scripts/build-ios.sh`, `scripts/build-android.sh`) |
 
+## SQLite linkage — `bundled-sqlite`
+
+`liters` links SQLite through rusqlite, and **which** SQLite matters more here
+than it does for most crates.
+
+| build | result |
+|---|---|
+| default (`bundled-sqlite`) | SQLite's amalgamation is compiled into the library. Self-contained, reproducible, and the only option on Android (the NDK exposes no public libsqlite3). |
+| `--no-default-features` | Link the platform's `libsqlite3` instead. |
+| `--features system-sqlite-bindgen` (with `--no-default-features`) | As above, but regenerate the bindings from the platform's own `sqlite3.h` (needs libclang). |
+
+**Use the unbundled build whenever another component in the same process
+already links its own SQLite.** POSIX advisory locks are dropped when *any*
+descriptor to the file is closed by the process; SQLite works around that with
+a process-global `unixInodeInfo` table — but only within **one copy** of the
+library. Two copies in one process each keep their own table and can silently
+drop each other's locks.
+
+That is a latent hazard for any SQLite user and a **correctness** issue for
+liters specifically: the writer's guarantee that no foreign checkpointer can
+restart the WAL under it *is* a long-running read lock (`sqlite::ReadLock`). If
+that lock is dropped, a foreign checkpoint restarts the WAL, the resume frame
+is overwritten, and `verify.rs` has to recover by uploading a full snapshot.
+
+The concrete case is an iOS app using **GRDB**, which links Apple's system
+`libsqlite3` via `.systemLibrary(name: "CSQLite")`. Build for it with:
+
+```sh
+SQLITE=system scripts/build-ios.sh
+```
+
+which is `cargo build -p liters-ffi --no-default-features`. Every SQLite symbol
+the unbundled `aarch64-apple-ios` staticlib leaves undefined (41 of them) is
+exported by the iOS SDK's `usr/lib/libsqlite3.tbd`, so it resolves against the
+same library GRDB uses.
+
 ## HTTP replication (liters-native)
 
 With the `http` feature, a liters process can serve its bucket over HTTP and
