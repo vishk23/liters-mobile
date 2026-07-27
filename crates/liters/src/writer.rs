@@ -70,6 +70,29 @@ pub struct PushResult {
     pub remote_txid: Txid,
     /// Whether a checkpoint ran during this push.
     pub checkpointed: bool,
+    /// Whether this push wrote a **full snapshot of the database** rather than
+    /// an incremental WAL delta.
+    ///
+    /// This is the cost that decides whether replicating from a mobile device
+    /// is viable: a snapshot ships the entire database, so a client that
+    /// snapshots on most pushes is doing full uploads with extra steps. It
+    /// happens when `verify()` cannot find its resume point — see
+    /// [`snapshot_reason`](Self::snapshot_reason) — which on iOS is a live
+    /// possibility on every app relaunch, because
+    /// [`MetaDir::write_sync_state`](crate::meta::MetaDir::write_sync_state)
+    /// deliberately does not persist `synced_to_wal_end` across a
+    /// writer close/reopen.
+    pub snapshotted: bool,
+    /// Why this push snapshotted, from `verify()`'s decision tree; `None` when
+    /// it did not. One of a small fixed set ("wal truncated by another
+    /// process", "last page does not exist in last ltx file, wal overwritten
+    /// by another process", "full or restart checkpoint detected,
+    /// snapshotting", "wal header salt reset, snapshotting", "first sync, no
+    /// local position"), so it is safe to aggregate on.
+    pub snapshot_reason: Option<&'static str>,
+    /// Bytes of LTX actually uploaded by this push, summed over
+    /// [`uploaded`](Self::uploaded) files. Zero when nothing was uploaded.
+    pub bytes_uploaded: u64,
 }
 
 pub(crate) struct SyncOutcome {
@@ -77,6 +100,10 @@ pub(crate) struct SyncOutcome {
     pub pos: Option<Pos>,
     pub new_wal_size: u64,
     pub synced_to_wal_end: bool,
+    /// `verify()`'s snapshot decision for this batch, carried out to
+    /// [`PushResult`] instead of being discarded.
+    pub snapshotted: bool,
+    pub snapshot_reason: Option<&'static str>,
 }
 
 /// Replicates one local SQLite database to a replica bucket.
@@ -267,6 +294,10 @@ impl Writer {
         let outcome = self.verify_and_sync(false, cancel)?;
         let synced = outcome.synced;
         let new_wal_size = outcome.new_wal_size;
+        // Captured before `apply_sync_outcome` consumes the outcome: whether
+        // this push degraded to a full snapshot is the one thing a caller
+        // cannot infer from the other fields.
+        let (snapshotted, snapshot_reason) = (outcome.snapshotted, outcome.snapshot_reason);
         self.apply_sync_outcome(outcome);
         if synced {
             self.state.synced_since_checkpoint = true;
@@ -283,7 +314,7 @@ impl Writer {
         // conversion above created — see ensure_lineage_checked for why that
         // is the correct outcome).
         self.ensure_lineage_checked(cancel)?;
-        let (uploaded, remote_txid) = self.upload(cancel)?;
+        let (uploaded, bytes_uploaded, remote_txid) = self.upload(cancel)?;
 
         // Uploaded L0s are prunable; always keep the newest (verify needs it).
         self.meta.prune_l0(remote_txid)?;
@@ -294,6 +325,9 @@ impl Writer {
             uploaded,
             remote_txid,
             checkpointed,
+            snapshotted,
+            snapshot_reason,
+            bytes_uploaded,
         })
     }
 
@@ -356,6 +390,8 @@ impl Writer {
             pos: None,
             new_wal_size: self.state.last_synced_wal_offset,
             synced_to_wal_end: self.state.synced_to_wal_end && !info.clear_synced_to_wal_end,
+            snapshotted: info.snapshotting,
+            snapshot_reason: info.reason,
         };
 
         let txid = Txid(pos.txid.0 + 1);
@@ -525,7 +561,8 @@ impl Writer {
     /// Callers must have passed the session lineage check first
     /// ([`Writer::ensure_lineage_checked`]): appending to an unverified
     /// bucket could interleave this lineage's TXIDs with a foreign writer's.
-    pub(crate) fn upload(&mut self, cancel: &CancelToken) -> Result<(u64, Txid)> {
+    /// Returns `(files uploaded, bytes uploaded, bucket max TXID)`.
+    pub(crate) fn upload(&mut self, cancel: &CancelToken) -> Result<(u64, u64, Txid)> {
         debug_assert!(self.lineage_checked, "upload() before the session lineage check");
         let remote = match self.remote_txid {
             Some(t) => t,
@@ -566,6 +603,7 @@ impl Writer {
 
         let local = self.pos()?.txid;
         let mut uploaded = 0u64;
+        let mut bytes_uploaded = 0u64;
         let mut cursor = remote;
         while cursor < local {
             // Cancelled between files: re-derive the remote position on the
@@ -584,6 +622,7 @@ impl Writer {
                     return Err(Error::LocalLtx { txid: next, msg: format!("open {path:?}: {e}") });
                 }
             };
+            let size = f.metadata().map(|m| m.len()).unwrap_or(0);
             let mut rd = std::io::BufReader::new(f);
             if let Err(e) = self.client.write_ltx_file(0, next, next, &mut rd) {
                 // Re-derive the remote position on the next push; uploads are
@@ -605,8 +644,9 @@ impl Writer {
                 let _ = self.meta.write_verified_pos(cursor);
             }
             uploaded += 1;
+            bytes_uploaded += size;
         }
-        Ok((uploaded, cursor))
+        Ok((uploaded, bytes_uploaded, cursor))
     }
 
     /// If the WAL is missing or headerless, force a write so it exists.

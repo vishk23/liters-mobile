@@ -188,6 +188,20 @@ pub struct PushSummary {
     pub remote_txid: u64,
     /// Whether a WAL checkpoint ran.
     pub checkpointed: bool,
+    /// Whether this push wrote a **full snapshot of the database** instead of
+    /// an incremental WAL delta.
+    ///
+    /// The one field worth logging on every push. A snapshot ships the whole
+    /// database, so a device that snapshots on most pushes is doing full
+    /// uploads with extra steps — and on iOS that is a live possibility on
+    /// every relaunch, because the `synced_to_wal_end` shortcut is
+    /// deliberately not persisted across a writer close/reopen.
+    pub snapshotted: bool,
+    /// Why, when `snapshotted`. One of a small fixed set from liters' verify
+    /// decision tree, so it is safe to aggregate on.
+    pub snapshot_reason: Option<String>,
+    /// Bytes of LTX uploaded by this push, across `uploaded` files.
+    pub bytes_uploaded: u64,
 }
 
 fn push_summary(r: liters::PushResult) -> PushSummary {
@@ -197,6 +211,9 @@ fn push_summary(r: liters::PushResult) -> PushSummary {
         uploaded: r.uploaded,
         remote_txid: r.remote_txid.0,
         checkpointed: r.checkpointed,
+        snapshotted: r.snapshotted,
+        snapshot_reason: r.snapshot_reason.map(str::to_owned),
+        bytes_uploaded: r.bytes_uploaded,
     }
 }
 

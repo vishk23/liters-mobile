@@ -22,7 +22,11 @@ pub struct SyncInfo {
     pub salt2: u32,
     /// True if a full database snapshot must be written.
     pub snapshotting: bool,
-    /// Human-readable reason when snapshotting.
+    /// Human-readable reason when snapshotting. Surfaced to callers on
+    /// [`crate::PushResult::snapshot_reason`]: on a device, how often a push
+    /// degrades to a full snapshot — and which of these branches caused it —
+    /// is the number that decides whether incremental replication is viable
+    /// there at all, and it is not observable from outside without this.
     pub reason: Option<&'static str>,
     /// Clear the synced-to-WAL-end flag (expected-truncation path, issue #927).
     pub clear_synced_to_wal_end: bool,
@@ -84,6 +88,7 @@ pub fn verify(
     // First sync ever: snapshot from the top of the WAL. (db.go:1503)
     if pos_txid.is_zero() {
         info.offset = WAL_HEADER_SIZE;
+        info.reason = Some("first sync, no local position");
         return Ok(info);
     }
 
