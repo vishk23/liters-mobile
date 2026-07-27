@@ -22,7 +22,13 @@ crc = "3"
 lz4_flex = { version = "0.13", default-features = false, features = ["std"] }
 twox-hash = { version = "2", default-features = false, features = ["std", "xxhash32"] }
 thiserror = "2"
-rusqlite = { version = "0.37", features = ["bundled"] }
+# Deliberately NO `bundled` here. Workspace dependency features are additive
+# and cannot be removed by a member, so hardcoding `bundled` at this level
+# makes it impossible for an embedder to link the platform's SQLite instead.
+# `liters` owns that choice through its own `bundled-sqlite` feature (on by
+# default); test-only users of rusqlite opt into `bundled` individually so
+# `cargo test` stays hermetic.
+rusqlite = { version = "0.37", default-features = false }
 tempfile = "3"
 proptest = "1"
 rand = "0.9"

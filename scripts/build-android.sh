@@ -5,6 +5,13 @@
 #   cargo install cargo-ndk
 #   rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
 #   ANDROID_NDK_HOME pointing at an NDK
+#
+# SQLite is always bundled here: the NDK exposes no public libsqlite3, so
+# unlike iOS (see build-ios.sh's SQLITE= switch) there is no platform library
+# to link against. An Android app that embeds its own SQLite (SQLCipher, the
+# AndroidX `sqlite-framework` bundled artifact, requery) is therefore in the
+# two-libraries-one-process situation described in build-ios.sh; the fix there
+# is to make BOTH sides use the same build, not to unbundle this one.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

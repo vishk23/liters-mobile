@@ -15,6 +15,36 @@ rand = { workspace = true }
 libc = "0.2"
 
 [features]
+default = ["bundled-sqlite"]
+
+# --- SQLite linkage. Pick exactly one; see docs/research/rust-ecosystem.md. ---
+#
+# `bundled-sqlite` (default) compiles SQLite's amalgamation into this crate.
+# Self-contained and reproducible, and the only option on Android (the NDK
+# exposes no public libsqlite3).
+#
+# Turn it off (`--no-default-features`) to link the *platform* libsqlite3
+# instead. That is REQUIRED whenever liters shares a process with another
+# component that already links its own SQLite — e.g. an iOS app using GRDB,
+# which links Apple's system `libsqlite3` via `.systemLibrary(name:
+# "CSQLite")`. Two SQLite copies in one process do not share the
+# process-global `unixInodeInfo` table that works around the POSIX
+# "close any fd, lose all locks" rule, so one library can silently drop the
+# other's advisory locks. liters' correctness rests on a long-running read
+# lock (see `sqlite::ReadLock`), so a dropped lock here does not merely risk
+# a busy error — it lets a foreign checkpoint restart the WAL under the
+# writer, exactly the case `verify.rs` has to recover from with a full
+# snapshot.
+bundled-sqlite = ["rusqlite/bundled"]
+
+# Optional companion to the unbundled path: generate the FFI bindings against
+# the platform's own `sqlite3.h` at build time rather than using rusqlite's
+# pre-generated ones. Costs a `bindgen`/libclang dependency; worth it when the
+# platform SQLite is older or newer than the version rusqlite pre-generated
+# for, or when you want the build to fail loudly on a symbol that is not
+# actually present.
+system-sqlite-bindgen = ["rusqlite/buildtime_bindgen"]
+
 # Passthrough features: enable the corresponding liters-storage backend and
 # the matching `StorageConfig` variant (manager module).
 http = ["liters-storage/http"]

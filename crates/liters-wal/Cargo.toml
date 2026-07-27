@@ -9,5 +9,7 @@ description = "SQLite WAL and database-header reading for liters"
 thiserror = { workspace = true }
 
 [dev-dependencies]
-rusqlite = { workspace = true }
+# Tests build their own fixture databases; bundle SQLite so the test suite is
+# hermetic and independent of whatever libsqlite3 the host happens to ship.
+rusqlite = { workspace = true, features = ["bundled"] }
 tempfile = { workspace = true }

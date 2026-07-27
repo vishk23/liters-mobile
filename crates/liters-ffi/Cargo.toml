@@ -14,11 +14,20 @@ name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
 
 [features]
-# Off by default: S3 pulls in object_store + the reqwest/hyper/rustls/tokio
-# async stack (several MB of `.so`) that a mobile app following over HTTP never
-# uses. Enable it (`--features s3`) to expose the `Storage::S3` variant.
-default = []
+# S3 is off by default: it pulls in object_store + the reqwest/hyper/rustls/
+# tokio async stack (several MB of `.so`) that a mobile app following over
+# HTTP never uses. Enable it (`--features s3`) to expose the `Storage::S3`
+# variant.
+default = ["bundled-sqlite"]
 s3 = ["liters/s3"]
+
+# SQLite linkage, forwarded to `liters` (which is depended on with
+# `default-features = false`, so the choice has to be re-exported here or the
+# default would be silently lost). Build with `--no-default-features` to link
+# the platform libsqlite3 — mandatory for an iOS app whose Swift side already
+# links Apple's system SQLite through GRDB. See `liters`' Cargo.toml for why.
+bundled-sqlite = ["liters/bundled-sqlite"]
+system-sqlite-bindgen = ["liters/system-sqlite-bindgen"]
 
 [dependencies]
 liters = { path = "../liters", default-features = false, features = ["http"] }
@@ -26,5 +35,7 @@ uniffi = { version = "0.32", features = ["cli"] }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-rusqlite = { workspace = true }
+# Tests build their own fixture databases; bundle SQLite so the test suite is
+# hermetic and independent of whatever libsqlite3 the host happens to ship.
+rusqlite = { workspace = true, features = ["bundled"] }
 tempfile = { workspace = true }
