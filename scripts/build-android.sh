@@ -24,7 +24,9 @@ cargo ndk $(for a in "${ABIS[@]}"; do echo -t "$a"; done) \
 # Kotlin bindings from the host library's embedded metadata.
 cargo build -p liters-ffi --release
 rm -rf "$OUT/kotlin" && mkdir -p "$OUT/kotlin"
-cargo run -p liters-ffi --bin uniffi-bindgen -- generate \
+# `--features cli` builds the generator; see the same call in build-ios.sh for
+# why it is not a default feature.
+cargo run -p liters-ffi --features cli --bin uniffi-bindgen -- generate \
   --library target/release/libliters_ffi.dylib \
   --language kotlin --out-dir "$OUT/kotlin"
 

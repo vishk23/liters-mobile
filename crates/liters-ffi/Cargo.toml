@@ -12,6 +12,9 @@ name = "liters_ffi"
 [[bin]]
 name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
+# Off unless asked for. Without this the bin is part of every build, and since
+# it needs `uniffi/cli`, so is `uniffi_bindgen` -- see the `cli` feature.
+required-features = ["cli"]
 
 [features]
 # S3 is off by default: it pulls in object_store + the reqwest/hyper/rustls/
@@ -20,6 +23,20 @@ path = "src/bin/uniffi-bindgen.rs"
 # variant.
 default = ["bundled-sqlite"]
 s3 = ["liters/s3"]
+
+# The `uniffi-bindgen` binary, and the `uniffi/cli` feature it needs.
+#
+# Off by default because `uniffi/cli` pulls in `uniffi_bindgen` -- askama,
+# cargo_metadata, goblin, clap and the rest of a code generator -- and cargo
+# unifies features across the whole graph, so declaring it unconditionally
+# makes it a NORMAL dependency of anything that depends on this crate. A host
+# cross-compiling the staticlib for an iPhone then builds a developer tool it
+# cannot run and does not link, once per target, at opt-level 3, with no way
+# to switch it off from its own manifest.
+#
+# Generate bindings with `cargo run -p liters-ffi --features cli --bin
+# uniffi-bindgen -- ...`, or point uniffi-bindgen at the built library.
+cli = ["uniffi/cli"]
 
 # SQLite linkage, forwarded to `liters` (which is depended on with
 # `default-features = false`, so the choice has to be re-exported here or the
@@ -31,7 +48,7 @@ system-sqlite-bindgen = ["liters/system-sqlite-bindgen"]
 
 [dependencies]
 liters = { path = "../liters", default-features = false, features = ["http"] }
-uniffi = { version = "0.32", features = ["cli"] }
+uniffi = { version = "0.32" }
 thiserror = { workspace = true }
 
 [dev-dependencies]

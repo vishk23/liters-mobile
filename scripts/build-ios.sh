@@ -47,7 +47,11 @@ done
 # API would otherwise produce bindings that do not match the shipped staticlib.
 cargo build -p liters-ffi --release "${FEATURE_ARGS[@]}"
 rm -rf "$BINDINGS" && mkdir -p "$BINDINGS"
-cargo run -p liters-ffi --bin uniffi-bindgen -- generate \
+# `--features cli` builds the generator. It is deliberately not a default: it
+# would otherwise be a normal dependency of every cross-compiled target above,
+# which is several minutes per slice of building a host tool the phone cannot
+# run. Additive to FEATURE_ARGS, so this stays a host-only cost.
+cargo run -p liters-ffi --features cli --bin uniffi-bindgen -- generate \
   --library target/release/libliters_ffi.dylib \
   --language swift --out-dir "$BINDINGS"
 
