@@ -52,7 +52,13 @@ uniffi = { version = "0.32" }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-# Tests build their own fixture databases; bundle SQLite so the test suite is
-# hermetic and independent of whatever libsqlite3 the host happens to ship.
-rusqlite = { workspace = true, features = ["bundled"] }
+# Tests build their own fixture databases. NO `features = ["bundled"]` here:
+# cargo unifies features across the whole graph, so pinning it would switch
+# `bundled` back on for `liters` itself and make
+# `cargo test -p liters-ffi --no-default-features` silently test the bundled
+# amalgamation -- the opposite of what the flag asks for, with nothing to
+# indicate it. Left unpinned, the fixtures follow whatever linkage is under
+# test: bundled by default (via `bundled-sqlite` -> `liters` -> `rusqlite`),
+# and the platform libsqlite3 when the default is off.
+rusqlite = { workspace = true }
 tempfile = { workspace = true }

@@ -39,5 +39,17 @@ jobs:
       - name: Run tests
         run: make test
 
+      # The other linkage. `bundled-sqlite` is on by default, so everything
+      # above compiles SQLite's amalgamation and nothing exercises the
+      # platform libsqlite3 that an embedder sharing a process with another
+      # SQLite (an iOS app on GRDB, say) is required to link instead. The two
+      # do not fail alike: a restored replica carrying a WAL header with no
+      # -shm is readable under the bundled 3.50.2 and CANTOPEN under 3.51.
+      - name: Run tests against the platform libsqlite3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
+          cargo test -p liters -p liters-ffi --no-default-features
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
