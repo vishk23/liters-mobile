@@ -621,3 +621,82 @@ fn transient_404_retries_without_snapshot_fallback() {
     assert_eq!(r.to_txid, Txid(4));
     assert_eq!(rows_of(&replica_path), rows_of(&db_path));
 }
+
+/// The restored image must present as a rollback-journal database, exactly as
+/// the incrementally-applied one does.
+///
+/// A snapshot's page 1 is a verbatim copy of the origin's, so without the
+/// fixup the replica inherits the origin's WAL journal-mode header while the
+/// `-wal`/`-shm` files it implies were just deleted. Nothing can then open the
+/// replica read-only — including `Replica::check_integrity` itself, and
+/// including the `rows_of` helper every test in this file reads through.
+///
+/// This asserts the header bytes rather than "a read-only open works" on
+/// purpose. Whether the broken state is *fatal* depends on the linked SQLite:
+/// the bundled amalgamation (3.50.2) tolerates the missing `-shm`, Apple's
+/// system libsqlite3 (3.51.0) fails with `SQLITE_CANTOPEN`. A behavioural
+/// assertion would therefore pass under `cargo test` on the default features
+/// and only catch the regression for whoever builds `--no-default-features`.
+/// The header bytes are the invariant in both.
+#[test]
+fn restored_replica_is_a_rollback_journal_file() {
+    fn journal_mode_bytes(path: &Path) -> [u8; 2] {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(path).unwrap();
+        f.seek(SeekFrom::Start(18)).unwrap();
+        let mut b = [0u8; 2];
+        f.read_exact(&mut b).unwrap();
+        b
+    }
+    fn assert_no_side_files(path: &Path) {
+        for suffix in ["-wal", "-shm"] {
+            let p = PathBuf::from(format!("{}{suffix}", path.display()));
+            assert!(!p.exists(), "{p:?} must not exist beside a replica");
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, db_path, bucket) = setup(tmp.path());
+    assert_eq!(
+        journal_mode_bytes(&db_path),
+        [0x02, 0x02],
+        "the fixture origin must be in WAL mode, or this test proves nothing"
+    );
+
+    let mut w = Writer::open(
+        &db_path,
+        Box::new(DirReplicaClient::new(&bucket)),
+        WriterOptions::default(),
+    )
+    .unwrap();
+    app.execute("INSERT INTO t (v) VALUES ('one')", []).unwrap();
+    w.push().unwrap();
+
+    // Full restore: the path that reads page 1 straight out of the snapshot.
+    let replica_path = tmp.path().join("replica.db");
+    let mut rep = Replica::open(
+        &replica_path,
+        Box::new(DirReplicaClient::new(&bucket)),
+        ReplicaOptions::default(),
+    );
+    assert!(rep.sync().unwrap().restored);
+    assert_eq!(
+        journal_mode_bytes(&replica_path),
+        [0x01, 0x01],
+        "a restored replica must not carry the origin's WAL header"
+    );
+    assert_no_side_files(&replica_path);
+    assert_eq!(rows_of(&replica_path), rows_of(&db_path));
+
+    // Incremental application must keep it that way.
+    app.execute("INSERT INTO t (v) VALUES ('two')", []).unwrap();
+    w.push().unwrap();
+    assert!(!rep.sync().unwrap().restored);
+    assert_eq!(
+        journal_mode_bytes(&replica_path),
+        [0x01, 0x01],
+        "an incremental apply must not restore the WAL header either"
+    );
+    assert_no_side_files(&replica_path);
+    assert_eq!(rows_of(&replica_path), rows_of(&db_path));
+}

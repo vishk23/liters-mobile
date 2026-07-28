@@ -126,6 +126,13 @@ impl Replica {
 
     /// The local database file. Open it read-only with plain SQLite; it is a
     /// rollback-journal-mode file (no -wal/-shm needed).
+    ///
+    /// Both writers of this file guarantee that: [`Replica::apply_spooled`]
+    /// rewrites page 1 on the incremental path, and [`Replica::restore`] runs
+    /// [`present_as_rollback_journal`] over the materialized image. A
+    /// snapshot's page 1 is otherwise a verbatim copy of the origin's, WAL
+    /// header and all, which a read-only reader cannot open once the side
+    /// files are gone.
     pub fn db_path(&self) -> &Path {
         &self.db_path
     }
@@ -441,6 +448,7 @@ impl Replica {
             let mut f = File::create(&tmp_path)?;
             let dec = Decoder::new(BufReader::new(File::open(&compacted_path)?));
             dec.decode_database_to(&mut f)?;
+            present_as_rollback_journal(&mut f)?;
             f.sync_all()?;
         }
         drop(compact_cleanup);
@@ -693,6 +701,17 @@ impl Replica {
         Ok(())
     }
 
+    /// `PRAGMA quick_check`/`integrity_check` over the freshly restored
+    /// image. (replica.go:1259-1293)
+    ///
+    /// This is the crate's only read-only open, and until
+    /// [`present_as_rollback_journal`] existed it was also the line every
+    /// restore under a system libsqlite3 died on: the image still carried the
+    /// origin's WAL journal-mode header while its `-shm` had just been
+    /// deleted, and a read-only connection may not rebuild one. Read-only is
+    /// the right flag for a check that must not mutate what it is checking —
+    /// it is safe here because the image is normalized before it lands, not
+    /// because the flag was ever the problem.
     fn check_integrity(&self) -> Result<()> {
         let pragma = match self.opts.integrity_check {
             IntegrityCheck::None => return Ok(()),
@@ -874,6 +893,37 @@ impl Drop for FcntlLock<'_> {
         let _ = set_fcntl_lock(self.f, UNLCK, SHARED_RANGE);
         let _ = set_fcntl_lock(self.f, UNLCK, PENDING_RANGE);
     }
+}
+
+/// Rewrites the two journal-mode bytes in the database header so the image
+/// reads as a rollback-journal database. (replica.go:876-910, vfs.go:802)
+///
+/// A snapshot's page 1 is a byte-for-byte copy of the origin's, so a restored
+/// image inherits the origin's journal mode — WAL, for anything liters
+/// replicates. WAL is a claim about files that are not there: the restore
+/// deletes `-wal`/`-shm`, and reading a WAL database requires the `-shm`
+/// shared-memory index. A reader that may not create one — any
+/// `SQLITE_OPEN_READONLY` connection — then fails on its first statement with
+/// `SQLITE_CANTOPEN`, and which SQLite is linked decides whether it does: the
+/// bundled amalgamation (3.50.2) tolerates it, Apple's system libsqlite3
+/// (3.51.0) does not. That made every restore path in the suite fail under
+/// `--no-default-features`, the linkage an iOS app whose Swift side already
+/// links SQLite through GRDB is required to use.
+///
+/// [`Replica::apply_spooled`] has always done this to page 1 on the
+/// incremental path, and [`Replica::db_path`] documents the result as the
+/// replica's contract. Only [`Replica::restore`] skipped it, so the two
+/// writers of the same file disagreed about what they produced.
+fn present_as_rollback_journal(f: &mut File) -> Result<()> {
+    // A database is at least one page, and the header is 100 bytes, so a
+    // shorter file is not one we can fix up. `restore` can produce it only
+    // from an empty snapshot, which has nothing to read either way.
+    if f.metadata()?.len() < 100 {
+        return Ok(());
+    }
+    f.seek(SeekFrom::Start(18))?;
+    f.write_all(&[0x01, 0x01])?;
+    Ok(())
 }
 
 /// Fresh handle + page size for in-place page application.
