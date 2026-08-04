@@ -550,8 +550,16 @@ runs the suite. Two groups of tests degrade to a `SKIP:` notice rather than
 failing: the oracle-backed ones without a Go toolchain, and the wal-reader
 fixture tests without that checkout, since they read litestream's own testdata
 out of it. Plain `cargo test --workspace` therefore wants `make reference` to
-have run at least once. `docs/research/` holds the format/internals notes the
-implementation was built from.
+have run at least once.
+
+Then run `make test-system-sqlite` for the other SQLite linkage — the default
+build never exercises it and the two do not fail alike, as
+[Testing the unbundled linkage](#testing-the-unbundled-linkage) sets out. A run
+with no `target/oracle` is quietly lighter than its summary line suggests,
+since the oracle-gated tests return early and still report `ok`.
+
+`docs/research/` holds the format/internals notes the implementation was built
+from.
 
 ## Design notes
 
