@@ -80,9 +80,9 @@ r.sync()?;                                  // restore on first call, then incre
 // open replica.db read-only with any SQLite
 ```
 
-The bucket that produces is Litestream's: `litestream restore -o out.db
-file:///bucket` works against it, and the test suite asserts exactly that
-against the real Go binaries — see [Compatibility](#compatibility).
+What that produces is an ordinary Litestream bucket: `litestream restore -o
+out.db file:///bucket` works against it, and the test suite asserts exactly
+that against the real Go binaries — see [Compatibility](#compatibility).
 
 Cargo features, defined on `liters` and re-exported by `liters-ffi`:
 
