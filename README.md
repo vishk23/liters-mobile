@@ -164,15 +164,10 @@ those tests print `SKIP:` instead of failing. Without a Go toolchain the
 oracle-backed tests skip the same way, and `make test` still runs.
 
 Use `make test-system-sqlite` rather than running
-`cargo test --no-default-features` by hand. The package selection in that
-target is load-bearing: `ltx`, `liters-wal` and `liters-storage` each
-dev-depend on `rusqlite` with `bundled`, and cargo unions features across the
-build, so a `--workspace` run silently switches `bundled` back on and tests the
-amalgamation while the flag says otherwise. `cargo tree --workspace
---no-default-features -e features -i rusqlite` shows `feature "bundled"` twice;
-the target's two-package selection shows it zero times. The target also makes
-the oracle a hard prerequisite, because the oracle-gated tests return early and
-still report `ok`.
+`cargo test --no-default-features` by hand — the package selection in that
+target is load-bearing, and a hand-rolled invocation can report all-green while
+testing the bundled amalgamation. See
+[Testing the unbundled linkage](#testing-the-unbundled-linkage).
 
 ## Production use
 
@@ -301,6 +296,61 @@ which is `cargo build -p liters-ffi --no-default-features`. Every SQLite symbol
 the unbundled `aarch64-apple-ios` staticlib leaves undefined (41 of them) is
 exported by the iOS SDK's `usr/lib/libsqlite3.tbd`, so it resolves against the
 same library GRDB uses.
+
+### Testing the unbundled linkage
+
+`bundled-sqlite` is on by default, so `make test` compiles the amalgamation and
+says nothing about the linkage an iOS host is required to use. That one has its
+own target, and CI runs both:
+
+```sh
+make test-system-sqlite
+```
+
+which is `cargo test -p liters -p liters-ffi --no-default-features` with the
+oracle binaries built first. To confirm a run really linked the platform
+library rather than quietly falling back:
+
+```sh
+otool -L target/debug/deps/replica_oracle-* | grep libsqlite3   # macOS
+ldd    target/debug/deps/replica_oracle-*  | grep libsqlite3    # Linux
+```
+
+Two things make a green run here easy to fake, and both have done so in this
+repo:
+
+- **Feature unification.** Cargo unions features across the whole build, so one
+  `rusqlite = { features = ["bundled"] }` anywhere in the selection — a
+  `[dev-dependencies]` entry included — switches `bundled` back on for `liters`
+  itself and reduces `--no-default-features` to a no-op, with no warning. This
+  is why the package selection in the target is narrow rather than
+  `--workspace`: `ltx`, `liters-wal` and `liters-storage` each pin `bundled`
+  for their own fixtures, so `cargo test --workspace --no-default-features` is
+  a *bundled* run. `cargo tree --workspace --no-default-features -e features -i
+  rusqlite` prints `feature "bundled"` twice; the same query on
+  `-p liters -p liters-ffi` prints it zero times. That query is the check — the
+  flag is not evidence.
+- **Silent oracle skips.** With no Go binaries in `target/oracle`, the interop
+  tests return early and still report `ok`. Running the bare `cargo test` line
+  instead of the make target is the easy way to drop every litestream
+  comparison and still see all-green.
+
+Running both linkages is not redundant, because they do not fail alike. A
+restored replica whose page 1 still carries the origin's WAL journal-mode
+header, with the `-wal`/`-shm` that header implies already deleted, is readable
+under the bundled amalgamation (3.50.2) and `SQLITE_CANTOPEN` under Apple's
+system `libsqlite3` (3.51.0). Every read-only open of a fresh restore fails
+there, and no amount of testing the default build can see it.
+
+Which way a build falls is a property of that build rather than of the version
+number: Homebrew's newer 3.53.2 reads the same file without complaint, and
+upstream's own `pagerOpenWalIfPresent` downgrades `journalMode` to DELETE when
+the `-wal` is missing, which is why tolerance is the common case. So do not
+read a green Linux CI run as cover for that class of bug — it probably does not
+reproduce there. That is why the CI matrix carries a macOS job on the platform
+`libsqlite3` in addition to the Linux one, and why divergences like it want an
+assertion on the bytes, which fails under either linkage, rather than on
+whether an open succeeds.
 
 ## HTTP replication (liters-native)
 
