@@ -1,127 +1,68 @@
 # liters-mobile
 
-Continuous SQLite replication you can embed in an iOS or Android app.
-[liters](https://github.com/mrkurt/liters) is a Rust library that reads and
-writes Litestream v0.5's LTX file format and bucket layout and exposes it to a
-host app through UniFFI. This repository carries the work that makes embedding
-it in a real mobile app practical: linking **one** SQLite instead of two, an
-HTTP path a suspended app can hand to a background `URLSession` instead of
-losing the upload, and per-push telemetry that turns "is this viable on this
-device?" into an answerable question. Each is described below.
+**Continuous SQLite replication you can embed in an iOS or Android app.**
+
+[![test](https://github.com/vishk23/liters-mobile/actions/workflows/test.yml/badge.svg)](https://github.com/vishk23/liters-mobile/actions/workflows/test.yml)
+&nbsp;·&nbsp; MIT &nbsp;·&nbsp; pre-1.0
+
+[Litestream](https://litestream.io) is the standard answer to "how do I get a
+SQLite database off this machine, continuously, without running a replication
+server?" — but it is a Go daemon that watches files, which is not something you
+can run inside an app that iOS suspends thirty seconds after the user swipes
+away. liters-mobile is a Rust library that reads and writes Litestream v0.5's
+LTX file format and bucket layout, exposed to Swift and Kotlin through UniFFI,
+with no daemon and no file watching: the app calls `push()` when it commits and
+`sync()` when it wants to read, every call is short, resumable and crash-safe,
+and the bucket that comes out restores with stock `litestream restore`. It is
+for people shipping a mobile app with a real local SQLite database — health
+data, offline-first notes, a local-first sync engine — who want that database
+continuously mirrored to storage they control, at page granularity, without
+inventing a row-level sync protocol.
 
 This is a derivative of [`mrkurt/liters`](https://github.com/mrkurt/liters) by
-Kurt Mackey, MIT-licensed and used with his permission. Kurt wrote liters —
-the LTX v0.5 codec, the SQLite WAL reader, the storage backends, the
-`Writer`/`Replica`/`Manager` surface, the HTTP replication protocol and the
-UniFFI bindings — which is the substantial majority of the code here; his
-commits keep their original SHAs, authorship and dates
-(`git log --author=mrkurt`), and `LICENSE` carries his copyright. The changes
-here are written to go back upstream and are proposed there from
-[vishk23/liters](https://github.com/vishk23/liters), the fork that stays the
-vehicle for upstream PRs. If you want liters itself, go to
-[mrkurt/liters](https://github.com/mrkurt/liters).
+Kurt Mackey, MIT-licensed and published with his permission. See
+[Relationship to mrkurt/liters](#relationship-to-mrkurtliters).
 
-## What this adds beyond upstream
+## How it works
 
-`main` is upstream [`108e1df`](https://github.com/mrkurt/liters/commit/108e1df)
-plus four changes, each developed on its own branch and merged with its history
-intact. All four are behaviour-compatible with upstream on the default build. A
-fifth branch, `reference-checkout-fetch`, upstream
-[#5](https://github.com/mrkurt/liters/pull/5), fixes the build rather than the
-library: a fresh clone could run neither `cargo test --workspace` nor
-`make test`, because the pinned litestream checkout the wal-reader fixture
-tests read from was fetched only by CI. `make reference` now fetches it, and
-CI calls that same target.
+- **Page-level LTX, not row-level sync.** A push encodes the SQLite pages that
+  changed into an LTX file — Litestream v0.5's transaction format: a 100-byte
+  header, per-page LZ4-block-compressed bodies, a page index, and a
+  CRC-64/GO-ISO checksum. There is no schema knowledge, no conflict resolution
+  and no merge. A bucket is the byte-exact history of one database, written by
+  one writer.
+- **The WAL is the change feed.** `liters-wal` reads SQLite's write-ahead log
+  directly — salt- and checksum-verified frames, folded into a page map per
+  committed transaction — so a push is "the pages committed since TXID N",
+  read out of a file SQLite already wrote. Nothing hooks your queries and
+  nothing watches the filesystem.
+- **The writer holds a long-running read lock and checkpoints itself.** That
+  is how Litestream guarantees no foreign checkpointer restarts the WAL out
+  from under the replication position, and liters ports it thresholds and all
+  (`min_checkpoint_page_n = 1000`, matching upstream `db.go`). It is also why
+  [which SQLite you link](#sqlite-linkage--bundled-sqlite) is a correctness
+  question on iOS rather than a packaging preference.
+- **Restore produces a real file, then follows incrementally.**
+  `Replica::sync()` materializes the newest snapshot plus the LTX chain above
+  it into an ordinary SQLite database you can open read-only with any SQLite;
+  every later sync applies only the new files. Each fetched file's CRC is
+  verified *before* its pages touch the live replica, and a pruned level or a
+  reseeded bucket is detected rather than silently followed.
+- **Compaction and retention run on the device.** Each writer is the sole
+  writer of its bucket prefix, so it is also its own compactor:
+  `Writer::maintain()` rolls L0 files up through the levels, takes snapshots,
+  and applies retention while preserving the invariants stock Litestream
+  readers depend on. There is no server-side component at all — a directory,
+  an S3 bucket, or another liters process over HTTP is the entire backend.
 
-**Optional SQLite bundling** — `sqlite-linkage-feature`, [`3919cc7`], upstream
-[#3](https://github.com/mrkurt/liters/pull/3). `rusqlite`'s `bundled` feature
-was hardcoded in `[workspace.dependencies]`, and workspace dependency features
-are additive — a member cannot remove them — so linking the *platform* SQLite
-was impossible tree-wide. This moves the choice into a `bundled-sqlite` feature
-(on by default, so nothing changes for existing users) with a
-`system-sqlite-bindgen` companion, re-exported through `liters-ffi`, and teaches
-`scripts/build-ios.sh` a `SQLITE=bundled|system|system-bindgen` switch applied
-to the device, simulator *and* bindings builds. This is the change that lets an
-iOS app link **one** SQLite instead of two: an app using GRDB already links
-Apple's system `libsqlite3`, and a second copy in the same process keeps its own
-`unixInodeInfo` table and can silently drop the first copy's advisory locks —
-which for liters is a correctness bug, not just a hazard, because the writer's
-guarantee that no foreign checkpointer restarts the WAL under it *is* a
-long-running read lock. See the [SQLite linkage](#sqlite-linkage--bundled-sqlite)
-section below.
+## Quickstart
 
-**Per-push snapshot/bytes telemetry** — `push-snapshot-telemetry`, [`194d8f9`].
-`verify()` already decided per push whether a full snapshot was required
-instead of an incremental WAL delta, and already recorded why, but nothing read
-it and neither the flag nor the reason reached `PushResult`. A caller could not
-distinguish a 400-byte delta from a whole-database upload except by watching
-byte counts and guessing. `PushResult` (and FFI `PushSummary`) now carry
-`snapshotted`, `snapshot_reason` (a small fixed set, so it aggregates), and
-`bytes_uploaded`. No behaviour change — the values come from state that already
-existed. This makes "is liters viable on this device?" an empirically
-answerable question rather than one needing a patched crate.
+### Rust
 
-**FFI transport and body fixes** — `ffi-transport-and-body`, [`0c6ae0f`]. Two
-independent bugs on the FFI's HTTP path. `Storage::into_config()` hardcoded
-`transport: None` and only `LitersManager` patched a host transport back in, so
-a plain `LitersWriter`/`LitersReplica` always ran on the built-in socket
-transport — which refuses `https://` outright and cannot hand a transfer to a
-background `URLSession`, meaning an iOS upload in flight at suspend was simply
-lost. `into_config_with(transport)` plus `new_with_http_client` constructors fix
-it. Separately, `ForeignBody::read` mapped an empty `BodyChunk::Data` to
-`BodyRead::Idle` on *every* request, violating `Idle`'s documented
-long-lived-only contract and spinning on a possibly-dead stream instead of
-raising an error the caller can act on.
-
-**Documentation corrections and LICENSE** — `docs-and-license`, [`4491124`],
-upstream [#2](https://github.com/mrkurt/liters/pull/2). Adds the MIT `LICENSE`
-file and aligns `Cargo.toml` (which said Apache-2.0 against a stated MIT
-intent), then corrects four in-tree claims that disagree with their own cited
-sources: the LZ4 frame settings attributed to `ltx encoder.go` (two of the four
-are pierrec/lz4 defaults, not set at that call site — and they are
-load-bearing), "byte-compatible with superfly/ltx v0.5.1" (it cannot be, by
-construction, since compressed sizes move the page index and hence the file
-checksum — "format-compatible" is accurate and is what the oracle suite
-asserts), `PageHeader::flags` "reserved; must be zero" (already outdated on ltx
-`main`), and an FFI claim that a foreign `wal_autocheckpoint` can never fire —
-true only while the read lock is held, which `Manager::sleep` releases by
-design, i.e. most of an iOS app's life. No behaviour change.
-
-## Status
-
-Verified on the integrated `main` (2026-07-27, rustc 1.97.1):
-
+```toml
+[dependencies]
+liters = { git = "https://github.com/vishk23/liters-mobile" }
 ```
-cargo test --workspace                                    195 passed, 0 failed
-cargo clippy --workspace --all-targets -- -D warnings      clean (exit 0)
-cargo build -p liters-ffi --no-default-features             ok (system SQLite)
-```
-
-Run `make reference` once after cloning — it fetches the pinned litestream
-checkout into `reference/`, which is not in the repo and which the wal-reader
-fixture tests read testdata from. It needs git only, not Go, and `make test`
-runs it for you. Without it those tests skip. See
-[Compatibility](#compatibility).
-
----
-
-# liters
-
-A Rust library, embeddable in iOS/Android apps, that reads and writes
-[Litestream](https://litestream.io) v0.5.x's LTX file format and bucket
-layout:
-
-- **Produce**: replicate a local, app-owned SQLite database to object storage
-  as LTX files. Buckets written by liters restore with stock
-  `litestream restore`.
-- **Consume**: maintain a local read-only replica of any litestream bucket,
-  applying new LTX files incrementally.
-
-Replication is driven by explicit calls — `push()` after commits, `sync()` to
-pull — because mobile apps own their write timing and background execution
-windows. There is no daemon and no file watching. Every operation is short,
-resumable, and crash-safe, sized for iOS `BGTaskScheduler` / Android
-`WorkManager` budgets.
 
 ```rust
 use liters::{Writer, WriterOptions, Replica, ReplicaOptions, DirReplicaClient};
@@ -138,6 +79,170 @@ let mut r = Replica::open("replica.db", Box::new(DirReplicaClient::new("/bucket"
 r.sync()?;                                  // restore on first call, then incremental
 // open replica.db read-only with any SQLite
 ```
+
+The bucket that produces is Litestream's: `litestream restore -o out.db
+file:///bucket` works against it, and the test suite asserts exactly that
+against the real Go binaries — see [Compatibility](#compatibility).
+
+Cargo features, defined on `liters` and re-exported by `liters-ffi`:
+
+| feature | default | what it does |
+|---|---|---|
+| `bundled-sqlite` | **on** | compile SQLite's amalgamation into the library. Turn it off (`--no-default-features`) to link the platform `libsqlite3` — [required if anything else in the process links SQLite](#sqlite-linkage--bundled-sqlite) |
+| `system-sqlite-bindgen` | off | with the above off, regenerate bindings from the platform's own `sqlite3.h` (needs libclang) |
+| `http` | off (on for `liters-ffi`) | the liters HTTP replication protocol: serve, follow, push |
+| `s3` | off | S3-compatible object storage in Litestream's S3 layout |
+| `cli` (`liters-ffi` only) | off | build the `uniffi-bindgen` binary. Deliberately not a default: `uniffi/cli` would otherwise become a normal dependency of every cross-compiled mobile slice |
+
+### iOS
+
+```sh
+SQLITE=system scripts/build-ios.sh
+```
+
+Produces `target/apple/Liters.xcframework` plus Swift sources in
+`target/apple/swift/`; add both to your SPM target. `SQLITE=system` builds
+`--no-default-features` and links Apple's system `libsqlite3` — **use it if
+your app already links SQLite** (GRDB does), and read
+[SQLite linkage](#sqlite-linkage--bundled-sqlite) for why that is not
+optional. `SQLITE=bundled` (the default) is correct only when nothing else in
+the process carries its own SQLite.
+
+```swift
+// A writer that hands every transfer to your own URLSession-backed client,
+// so an upload in flight when iOS suspends the app is not lost.
+let writer = try LitersWriter.newWithHttpClient(
+    dbPath: dbPath,
+    storage: .http(url: "https://sync.example/db", authToken: token),
+    httpClient: MyURLSessionClient())
+
+let summary = try writer.push()
+if summary.snapshotted {
+    log("full snapshot: \(summary.snapshotReason ?? "?"), \(summary.bytesUploaded) bytes")
+}
+```
+
+The FFI exports `LitersWriter`, `LitersReplica`, and `LitersManager` — the
+last for several databases at once, with `sleepAll()` / `resumeAll()` for
+backgrounding and a `ManagerListener` callback interface for state changes and
+push completions. `HttpClient` is a foreign trait: implement it in Swift and
+the platform owns TLS, the system trust store, keepalive, and background
+transfers. Without one, the built-in socket transport is `http://`-only.
+
+**Set `wal_autocheckpoint = 0` on every connection your app opens to a
+replicated database.** liters takes over checkpointing; a foreign
+autocheckpoint firing while the app is backgrounded (when liters has released
+its read lock) restarts the WAL and forces the next push to upload a full
+snapshot.
+
+### Android
+
+```sh
+scripts/build-android.sh
+```
+
+Produces `target/android/jniLibs/{arm64-v8a,armeabi-v7a,x86_64}/libliters_ffi.so`
+plus Kotlin sources in `target/android/kotlin/` (package into your AAR;
+requires JNA). SQLite is always bundled here — the NDK exposes no public
+`libsqlite3`, so there is no platform library to link against.
+
+Both scripts run `cargo run -p liters-ffi --features cli --bin uniffi-bindgen`
+for the binding-generation step, which is the entire reason the `cli` feature
+exists.
+
+### Building and testing from a clone
+
+```sh
+make reference   # fetch the pinned litestream checkout (git only, no Go needed)
+make test        # builds the Go oracle if available, then cargo test --workspace
+```
+
+`make reference` is required once: `reference/` is not checked in, and the
+wal-reader fixture tests read Litestream's own testdata out of it. Without it
+those tests print `SKIP:` instead of failing. Without a Go toolchain the
+oracle-backed tests skip the same way, and `make test` still runs.
+
+## Production use
+
+liters-mobile has been running in production since 2026-07-30 in an
+open-source WHOOP-client iOS app (a fork of
+[ryanbr/noop](https://github.com/ryanbr/noop)), continuously replicating a
+live health-metrics SQLite database from an iPhone to a Fly.io server over the
+HTTP replication protocol, on the unbundled (`SQLITE=system`) linkage
+alongside GRDB.
+
+That is one app, one deployment, one person's device. It is real evidence that
+the mobile path works end to end on real hardware under real backgrounding. It
+is not a claim of broad production hardening, and it should not be read as one.
+
+## Relationship to mrkurt/liters
+
+liters is Kurt Mackey's work. The LTX v0.5 codec, the SQLite WAL reader, the
+storage backends, the `Writer`/`Replica`/`Manager` surface, the HTTP
+replication protocol and the UniFFI bindings are all his, and they are the
+substantial majority of the code in this repository. His commits keep their
+original SHAs, authorship and dates (`git log --author=kurt`), and `LICENSE`
+carries his copyright.
+
+This repository exists because embedding liters in a shipping mobile app
+turned up a handful of concrete fixes, and having them in one installable
+place was useful while they were in review. Every one of them is also offered
+upstream as a pull request:
+
+| upstream PR | what it fixes |
+|---|---|
+| [#2](https://github.com/mrkurt/liters/pull/2) | four in-tree doc claims that disagree with their own cited sources, plus a draft MIT `LICENSE` |
+| [#3](https://github.com/mrkurt/liters/pull/3) | `rusqlite/bundled` hardcoded in `[workspace.dependencies]`, which made the platform-SQLite linkage impossible tree-wide |
+| [#5](https://github.com/mrkurt/liters/pull/5) | a fresh clone could run neither `cargo test --workspace` nor `make test` |
+| [#6](https://github.com/mrkurt/liters/pull/6) | a restored replica presented as a WAL-mode file with no `-shm`, which newer SQLite refuses to open |
+| [#7](https://github.com/mrkurt/liters/pull/7) | `uniffi/cli` as an unconditional dependency, building a host code generator once per cross-compiled mobile slice |
+| [#9](https://github.com/mrkurt/liters/pull/9) | the replica-file lock blocked forever (`F_SETLKW`) with no deadline and no cancellation |
+
+Upstream has been quiet since 2026-07-24 and those PRs are open. That is
+entirely fine. This is not a hostile fork and not a competing project: if Kurt
+merges them, the right move for most people is to depend on `mrkurt/liters`
+directly and for this repository to go back to being thin, or to nothing at
+all. **If you want liters itself, go to
+[mrkurt/liters](https://github.com/mrkurt/liters).**
+
+Upstream PRs are proposed from [vishk23/liters](https://github.com/vishk23/liters),
+which stays the vehicle for them; this repository is the packaged, installable
+form.
+
+## Status and roadmap
+
+**Pre-1.0. The API will move.** Nothing here is published to crates.io yet and
+no compatibility promise is made across commits — pin a revision. The on-disk
+and on-the-wire formats are considerably more stable than the Rust API,
+because they are Litestream's rather than ours.
+
+Verified on `main` (rustc 1.97.1, macOS aarch64, Go 1.26.5):
+
+```
+make test                                                 202 passed, 0 failed
+cargo clippy --workspace --all-targets -- -D warnings      clean (exit 0)
+cargo test -p liters -p liters-ffi --no-default-features    ok (platform SQLite)
+```
+
+Known gaps, in rough order of how much they are likely to bother a new user:
+
+- **No crates.io release.** Git dependency only.
+- **The HTTP replication protocol is liters' own**, not Litestream's — it
+  interoperates with other liters instances, not with the `litestream` binary.
+  The *files* it moves are Litestream-format LTX either way. Specified
+  normatively in [docs/http-protocol.md](docs/http-protocol.md).
+- **No TLS in the built-in server.** Front it with a reverse proxy.
+- **Write leases are in-memory** — a dual-writer detector, not a distributed
+  lock. Bucket integrity across server restarts rests on L0 TXID monotonicity.
+- **No VFS read replica.** Litestream v0.5 has one; liters materializes a real
+  file instead.
+- **Single writer per bucket prefix**, by construction. That is Litestream's
+  model, not something liters adds.
+- **No published Swift package or AAR.** Run the build scripts yourself.
+
+---
+
+# Reference
 
 ## Crates
 
@@ -345,6 +450,17 @@ The same surface ships over FFI: `liters-ffi` exports `LitersWriter` /
 callbacks arrive on worker threads and must not block). Live follow over
 FFI goes through `LitersManager.register_follow`.
 
+### Per-push telemetry
+
+`PushResult` (FFI: `PushSummary`) carries `snapshotted`, `snapshot_reason` and
+`bytes_uploaded` alongside the position, so a host can tell a 400-byte
+incremental delta from a whole-database re-upload without watching byte
+counters and guessing. `snapshot_reason` is a small fixed set drawn from
+liters' verify decision tree, so it is safe to aggregate across devices. This
+is what makes "is liters viable on this device, on this network, at this
+database size?" an empirically answerable question rather than one that needs
+a patched crate.
+
 ## Compatibility
 
 Liters has two compatibility surfaces, and only one is litestream's. The
@@ -387,7 +503,17 @@ implementation was built from.
   live replica, falls back to applying a newer snapshot in place when
   levels 0–8 are pruned, and detects bucket reseeds as divergence — three
   deliberate hardenings over upstream's follow mode.
+- A restored replica is left presenting as a rollback-journal file rather than
+  a WAL-mode file with no `-shm`, which SQLite 3.51 refuses to open read-only.
+- The replica-file lock is taken with a deadline and a cancellation check
+  rather than a bare `F_SETLKW`. A daemon on a server can be restarted when a
+  reader wedges it; a library inside someone else's app cannot.
 - Compaction/retention run device-side (`Writer::maintain`): each device is
   the sole writer of its prefix, hence also its sole compactor. Retention
   preserves the invariants stock readers rely on (newest snapshot kept, ≥1
   file per level, no L0 gaps).
+
+## License
+
+MIT — see [LICENSE](LICENSE), which carries Kurt Mackey's copyright for the
+original work alongside the derivative one.
