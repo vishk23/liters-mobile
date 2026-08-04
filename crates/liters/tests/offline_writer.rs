@@ -93,6 +93,32 @@ fn litestream_restore(oracle: &Path, bucket: &Path, out_db: &Path) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    normalize_restored_journal_mode(out_db);
+}
+
+/// Normalizes the journal-mode header of a database the **Go** `litestream`
+/// binary just restored.
+///
+/// Go's restore writes page 1 verbatim out of the snapshot, so the restored
+/// file inherits the ORIGIN's journal-mode header (offsets 18/19 = 0x02 0x02,
+/// WAL) while no `-wal`/`-shm` sidecar is written next to it. Reading a WAL
+/// database requires the `-shm` shared-memory index and a
+/// `SQLITE_OPEN_READONLY` connection may not create one, so a read-only open
+/// of Go's own restore output fails with `SQLITE_CANTOPEN` under SQLite 3.51
+/// (Apple's system libsqlite3, i.e. `--no-default-features` on macOS) while
+/// the bundled 3.50.2 tolerates it. Measured: `hdr[18,19] = [2, 2]`, no
+/// `-wal`, no `-shm`.
+///
+/// This is the same defect `Replica::restore` fixes for liters' OWN output.
+/// The Go binary's output is not ours to fix, so the header is normalized
+/// here instead of weakening the read-only open the assertions rely on. Only
+/// bytes 18/19 change, nothing checksums them, and the pages being compared
+/// are untouched.
+fn normalize_restored_journal_mode(db: &Path) {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut f = std::fs::OpenOptions::new().write(true).open(db).unwrap();
+    f.seek(SeekFrom::Start(18)).unwrap();
+    f.write_all(&[0x01, 0x01]).unwrap();
 }
 
 /// The "device is offline" backend: every operation fails with a transient
