@@ -27,10 +27,10 @@ Kurt Mackey, MIT-licensed and published with his permission. See
 
 - **Page-level LTX, not row-level sync.** A push encodes the SQLite pages that
   changed into an LTX file — Litestream v0.5's transaction format: a 100-byte
-  header, per-page LZ4-block-compressed bodies, a page index, and a
-  CRC-64/GO-ISO checksum. There is no schema knowledge, no conflict resolution
-  and no merge. A bucket is the byte-exact history of one database, written by
-  one writer.
+  header, one standalone LZ4 frame per page, a page index, and a CRC-64/GO-ISO
+  checksum over the uncompressed page bytes. There is no schema knowledge, no
+  conflict resolution and no merge. A bucket is the byte-exact history of one
+  database, written by one writer.
 - **The WAL is the change feed.** `liters-wal` reads SQLite's write-ahead log
   directly — salt- and checksum-verified frames, folded into a page map per
   committed transaction — so a push is "the pages committed since TXID N",
