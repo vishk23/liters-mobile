@@ -53,3 +53,31 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # The platform libsqlite3 again, but a NEWER one. The ubuntu job's
+  # libsqlite3-dev is old enough to tolerate a WAL journal-mode header with no
+  # -shm alongside it; macOS ships SQLite 3.51, which returns CANTOPEN on a
+  # read-only open of exactly that file. That difference is the whole substance
+  # of the restored-replica fix (upstream #6), and the ubuntu job structurally
+  # cannot see it — a regression there would land green. This job is the guard.
+  #
+  # No MinIO: the S3 oracle tests skip without it, which is fine here. Go is
+  # preinstalled on the macOS runners, so the rest of the oracle still builds.
+  macos-system-sqlite:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Fetch litestream reference checkout
+        run: make reference
+
+      - name: Build Go oracle binaries
+        run: make oracle
+
+      - name: Run tests against Apple's system libsqlite3
+        run: cargo test -p liters -p liters-ffi --no-default-features
