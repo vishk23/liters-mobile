@@ -73,11 +73,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Fetch litestream reference checkout
-        run: make reference
-
-      - name: Build Go oracle binaries
-        run: make oracle
-
+      # `make test-system-sqlite` (not a bare cargo invocation): it fetches the
+      # reference checkout, makes the oracle a hard prerequisite, and pins the
+      # package selection that keeps `bundled` out of the feature union.
       - name: Run tests against Apple's system libsqlite3
-        run: cargo test -p liters -p liters-ffi --no-default-features
+        run: make test-system-sqlite

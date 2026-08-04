@@ -23,7 +23,7 @@ REFERENCE_DIR := $(CURDIR)/reference/litestream
 # `make reference`, so CI and a local clone can never drift to different refs.
 LITESTREAM_REF := c96c0f42a51bf48a40e13a1569a46312e957b429
 
-.PHONY: oracle reference test clean-oracle clean-reference
+.PHONY: oracle reference test test-system-sqlite clean-oracle clean-reference
 
 # Idempotent: re-fetches only when the checkout is missing or off the pin,
 # so bumping LITESTREAM_REF above is enough to move it.
@@ -63,6 +63,29 @@ test: reference
 		echo "note: no Go toolchain; skipping the oracle build (oracle-backed tests will print SKIP)"; \
 	fi
 	LITERS_ORACLE_DIR=$(ORACLE_DIR) cargo test --workspace
+
+# The other SQLite linkage. `bundled-sqlite` is on by default, so `test` above
+# compiles the amalgamation and nothing in it exercises the platform
+# libsqlite3 that an embedder sharing a process with another SQLite -- an iOS
+# app on GRDB -- is required to link instead.
+#
+# The package selection is load-bearing, not a shortcut. `ltx`, `liters-wal`
+# and `liters-storage` each dev-depend on `rusqlite = { features =
+# ["bundled"] }` to keep their own fixtures hermetic, and cargo unions
+# features across the whole build: pull any of them into the selection and
+# `bundled` comes back on for `liters` itself. `cargo tree --workspace
+# --no-default-features -e features -i rusqlite` shows `feature "bundled"`
+# twice; the two-package selection below shows it zero times. So
+# `make test-system-sqlite` is the unbundled run and `--workspace
+# --no-default-features` is the bundled one wearing its flag.
+#
+# The oracle is a hard prerequisite here, unlike `test`, and it matters more:
+# the oracle-gated tests return early and still report `ok`, so a bare
+# `cargo test -p liters -p liters-ffi --no-default-features` on a tree with no
+# `target/oracle` goes green having silently skipped the entire litestream
+# comparison, with nothing in the output to say so.
+test-system-sqlite: reference oracle
+	LITERS_ORACLE_DIR=$(ORACLE_DIR) cargo test -p liters -p liters-ffi --no-default-features
 
 clean-oracle:
 	rm -rf $(ORACLE_DIR)

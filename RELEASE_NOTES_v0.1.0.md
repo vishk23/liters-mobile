@@ -75,6 +75,12 @@ is the packaged, installable form, not a competing project.
   litestream checkout the wal-reader fixture tests read from (git only, no Go);
   CI calls the same target, so the two cannot drift.
   [#5](https://github.com/mrkurt/liters/pull/5)
+- **`make test-system-sqlite`** runs the suite against the platform
+  `libsqlite3`. The package selection is load-bearing: the other crates
+  dev-depend on `rusqlite` with `bundled`, and cargo unions features across the
+  build, so a `--workspace --no-default-features` run silently tests the
+  amalgamation anyway.
+  [#3](https://github.com/mrkurt/liters/pull/3)
 - **The test suite passes on the platform-SQLite linkage**, not only the
   bundled one. Sixteen tests across four targets failed under
   `--no-default-features` on macOS — not a liters defect, but the Go

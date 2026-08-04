@@ -153,14 +153,26 @@ exists.
 ### Building and testing from a clone
 
 ```sh
-make reference   # fetch the pinned litestream checkout (git only, no Go needed)
-make test        # builds the Go oracle if available, then cargo test --workspace
+make reference           # fetch the pinned litestream checkout (git only, no Go needed)
+make test                # builds the Go oracle if available, then cargo test --workspace
+make test-system-sqlite  # the same suite against the PLATFORM libsqlite3
 ```
 
 `make reference` is required once: `reference/` is not checked in, and the
 wal-reader fixture tests read Litestream's own testdata out of it. Without it
 those tests print `SKIP:` instead of failing. Without a Go toolchain the
 oracle-backed tests skip the same way, and `make test` still runs.
+
+Use `make test-system-sqlite` rather than running
+`cargo test --no-default-features` by hand. The package selection in that
+target is load-bearing: `ltx`, `liters-wal` and `liters-storage` each
+dev-depend on `rusqlite` with `bundled`, and cargo unions features across the
+build, so a `--workspace` run silently switches `bundled` back on and tests the
+amalgamation while the flag says otherwise. `cargo tree --workspace
+--no-default-features -e features -i rusqlite` shows `feature "bundled"` twice;
+the target's two-package selection shows it zero times. The target also makes
+the oracle a hard prerequisite, because the oracle-gated tests return early and
+still report `ok`.
 
 ## Production use
 

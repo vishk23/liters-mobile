@@ -87,6 +87,16 @@ is also offered upstream as a pull request.
   `snapshot_reason` (a small fixed set, so it aggregates) and
   `bytes_uploaded`. No behaviour change — the values come from state that
   already existed.
+- **`make test-system-sqlite`**, the unbundled-linkage run. The package
+  selection is load-bearing rather than a shortcut: `ltx`, `liters-wal` and
+  `liters-storage` each dev-depend on `rusqlite` with `bundled` to keep their
+  own fixtures hermetic, and cargo unions features across the build, so a
+  `--workspace --no-default-features` run silently tests the amalgamation
+  anyway. `cargo tree --workspace --no-default-features -e features -i
+  rusqlite` shows `feature "bundled"` twice; the target's selection shows it
+  zero times. The target also makes the oracle a hard prerequisite, because the
+  oracle-gated tests return early and still report `ok`.
+  ([upstream #3](https://github.com/mrkurt/liters/pull/3))
 - **`cli` feature on `liters-ffi`** gating the `uniffi-bindgen` binary and the
   `uniffi/cli` feature it needs. `uniffi/cli` pulls in `uniffi_bindgen`
   (askama, cargo_metadata, goblin, clap), and cargo unifies features across
